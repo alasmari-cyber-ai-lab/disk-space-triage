@@ -8,7 +8,8 @@ where model caches, package caches, container disks and virtual environments
 fill `C:` faster than anything a normal cleanup tool looks for.
 
 It never moves or deletes anything. It tells you which **one setting** frees
-the most space, and you make the change.
+the most space. For the common caches it can also apply that setting for you,
+if you allow it and confirm each change.
 
 ## What it tells you
 
@@ -31,6 +32,7 @@ row is the single change that frees the most space.
 2. Read the script if you want to. It is one plain-text file.
 3. Double-click `Start-DiskSpaceTriage.cmd`. Run it as your normal user, **not** as administrator.
 4. Choose **Scan**, then **Export report**. Reports go to `Documents\DiskReports`.
+5. Optional: on the **Fix with one setting** tab, tick the box, select a row and choose **Apply selected**.
 
 From a terminal:
 
@@ -60,6 +62,24 @@ To check your download, compare its hash with the one on the release page:
 Get-FileHash .\DiskSpaceTriage.ps1 -Algorithm SHA256
 ```
 
+## The one change it can make
+
+The scan is read-only. On the **Fix with one setting** tab the tool can, for a
+fixed list of cache stores (`HF_HOME`, `TORCH_HOME`, `PIP_CACHE_DIR`,
+`npm_config_cache`, `OLLAMA_MODELS` and a few more):
+
+1. create an empty folder on the other drive, with the same name and position
+   it has on `C:`, below `D:\FromC`:
+   `C:\Users\you\.cache\huggingface` becomes `D:\FromC\Users\you\.cache\huggingface`;
+2. set the matching **user** environment variable to that folder.
+
+That is all. It does not move or delete the old folder, it never touches a
+variable you have already set, it needs no administrator rights, it asks
+before every change, it writes each change to `DiskTriage_actions.csv`, and
+**Undo last change** removes the variable again. Stores that also hold tools,
+credentials or your own data (Cargo, Gradle, Docker, WSL, games) are not on
+the list and stay manual.
+
 ## Why you can trust it
 
 These are properties of the code, checked on every commit, not promises.
@@ -67,12 +87,13 @@ These are properties of the code, checked on every commit, not promises.
 | Property | How it is enforced |
 | --- | --- |
 | No network access | [`tests/Capability.Tests.ps1`](tests/Capability.Tests.ps1) parses the script and fails the build if any command, .NET type, static call or instance method outside a short allowlist appears. Only local fixed disks are scanned; network drives are refused. CI also runs a real scan with outbound traffic blocked by the firewall. |
-| Read-only on everything it scans | Same allowlist: no move, copy, delete, set or open call exists in the script. A test compares the names, sizes and timestamps of a scanned tree before and after. |
+| Never moves or deletes; the scan is read-only | Same allowlist: no move, copy, delete or open call exists in the script. A test compares the names, sizes and timestamps of a scanned tree before and after. |
+| Changes only what you confirm | The single setter call may appear in exactly two functions, must take its variable name from the fixed list and must target the current user. Tests set a real variable, check the refusals (unknown variable, folder outside `FromC`, already set) and undo it. |
 | Never reads file contents | Only names, sizes, timestamps and attributes are accessed. |
 | No administrator rights | It refuses to start elevated. CI checks the refusal. |
 | No hidden code | No `Invoke-Expression`, compiled C#, reflection, COM or external processes. One `Add-Type` call loads the WPF assemblies that ship with Windows; the test pins that line exactly. |
-| Writes only its reports | Three files per export, to a folder on a local fixed disk. Network paths, mapped network drives, USB sticks, and any folder that is or sits below a junction or symbolic link are refused. |
-| No persistence | No registry keys, services or scheduled tasks. |
+| Writes only its reports and log | Three files per export plus the action log, to a folder on a local fixed disk; and empty folders below `FromC` for confirmed redirects. Network paths, mapped network drives, USB sticks, and any folder that is or sits below a junction or symbolic link are refused. |
+| No persistence | No services, scheduled tasks or start-up entries. The only lasting traces are the reports and any user variable you chose to set. |
 | The report is safe to open | Self-contained HTML with a Content-Security-Policy that blocks every external request; file paths are inserted as text, never as markup. |
 
 More detail, including what it does **not** protect against, is in [SECURITY.md](SECURITY.md).

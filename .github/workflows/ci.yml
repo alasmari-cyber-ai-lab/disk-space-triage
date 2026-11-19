@@ -100,12 +100,22 @@ jobs:
         run: |
           & .\DiskSpaceTriage.ps1 -Mode SelfTest -ReportDirectory (Join-Path $env:RUNNER_TEMP 'scan') -AllowElevated
 
-      - name: Print the window screenshot (base64) for review from the log
+      - name: Print the window screenshots (base64) for review from the log
         run: |
-          $png = Join-Path $env:RUNNER_TEMP 'scan\selftest-window.png'
-          Write-Host '-----BEGIN PNG-----'
-          [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($png), 'InsertLineBreaks')
-          Write-Host '-----END PNG-----'
+          foreach ($name in 'selftest-window.png', 'selftest-window-fix.png') {
+            $png = Join-Path $env:RUNNER_TEMP "scan\$name"
+            Write-Host "-----BEGIN PNG $name-----"
+            [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($png), 'InsertLineBreaks')
+            Write-Host "-----END PNG $name-----"
+          }
+
+      - name: The self-test and the console scan changed no user variable
+        run: |
+          foreach ($name in 'HF_HOME', 'PIP_CACHE_DIR', 'TORCH_HOME', 'OLLAMA_MODELS', 'npm_config_cache') {
+            if ([Environment]::GetEnvironmentVariable($name, 'User')) { throw "$name was set, but nothing asked for it." }
+          }
+          if (Test-Path 'D:\FromC') { throw 'D:\FromC exists, but nothing asked for it.' }
+          Write-Host 'No variable set, no folder created.'
 
       - name: Refuses to run elevated without the override
         run: |

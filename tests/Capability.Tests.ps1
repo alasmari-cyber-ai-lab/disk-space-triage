@@ -42,7 +42,7 @@ BeforeAll {
         'System.UnauthorizedAccessException', 'System.Security.SecurityException',
         'System.Management.Automation.WildcardOptions', 'System.Text.RegularExpressions.RegexOptions',
         'System.Windows.Clipboard', 'System.Windows.MessageBox', 'System.Windows.MessageBoxButton',
-        'System.Windows.MessageBoxImage', 'System.Windows.Markup.XamlReader',
+        'System.Windows.MessageBoxImage', 'System.Windows.MessageBoxResult', 'System.Windows.Markup.XamlReader',
         'System.Windows.Media.Imaging.BitmapFrame', 'System.Windows.Media.PixelFormats',
         'System.Windows.Threading.DispatcherPriority'
     )
@@ -66,16 +66,17 @@ BeforeAll {
         'ContainsKey', 'Dequeue', 'Dispose', 'EndsWith', 'Enqueue', 'EnumerateDirectories', 'EnumerateFiles',
         'FindName', 'FindResource', 'GetEnumerator', 'Invoke', 'IsInRole', 'IsMatch', 'LastIndexOf', 'Measure',
         'Render', 'Replace', 'Save', 'ShowDialog', 'StartsWith', 'Substring', 'ToArray', 'ToLowerInvariant',
+        'Add_Checked', 'Add_Unchecked', 'Split', 'RemoveAt',
         'ToString', 'ToUpper', 'Trim', 'TrimEnd', 'UpdateLayout'
     )
 
     # Static members allowed on the types that could otherwise read, write or reach out.
     $script:AllowedStaticMembers = @{
         'System.IO.File'                    = @('Create')
-        'System.IO.Path'                    = @('GetFullPath', 'GetDirectoryName')
+        'System.IO.Path'                    = @('GetFullPath', 'GetDirectoryName', 'GetFileName')
         'scriptblock'                       = @()
         'System.Globalization.CultureInfo'  = @('InvariantCulture')
-        'Environment'                       = @('GetFolderPath')
+        'Environment'                       = @('GetFolderPath', 'GetEnvironmentVariable', 'SetEnvironmentVariable')
         'System.Windows.Markup.XamlReader'  = @('Parse')
         'System.Windows.Clipboard'          = @('SetText')
         'System.Windows.MessageBox'         = @('Show')
@@ -136,9 +137,9 @@ Describe 'Commands' {
         @($bad) | Should -BeNullOrEmpty
     }
 
-    It 'writes files only from the report and self-test functions' {
+    It 'writes files only from the report, self-test and action-log functions' {
         $writers = @('Out-File', 'Export-Csv', 'New-Item')
-        $allowedIn = @('Export-TriageReport', 'Resolve-ReportDirectory', 'Invoke-TriageSelfTest')
+        $allowedIn = @('Export-TriageReport', 'Resolve-ReportDirectory', 'Invoke-TriageSelfTest', 'Set-TriageRedirect', 'Write-TriageActionLog')
         $bad = foreach ($c in ($script:Commands | Where-Object { $writers -contains $_.GetCommandName() })) {
             $where = Get-EnclosingFunction -Node $c
             if ($allowedIn -notcontains $where) { "$($c.GetCommandName()) in $where (line $($c.Extent.StartLineNumber))" }
@@ -191,7 +192,7 @@ Describe '.NET surface' {
             if ($call.Member.Extent.Text -eq 'Invoke') {
                 ($call.Extent.Text -replace '\s+', ' ') | Should -Match 'Dispatcher\.Invoke\(\[System\.Action\]\{ \}, \[System\.Windows\.Threading\.DispatcherPriority\]::(Background|ApplicationIdle)\)$'
             } else {
-                Get-EnclosingFunction -Node $call | Should -Be 'Test-TriageGui'
+                Get-EnclosingFunction -Node $call | Should -Be 'Save-TriageWindowPng'
             }
         }
     }
@@ -217,12 +218,38 @@ Describe '.NET surface' {
         }
     }
 
+    It 'changes environment variables only in the two action functions, and only for the current user' {
+        $sets = @($script:Ast.FindAll({ param($n)
+            $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and $n.Static -and
+            $n.Member.Extent.Text -eq 'SetEnvironmentVariable' }, $true))
+        $sets.Count | Should -Be 2
+        foreach ($call in $sets) {
+            Get-EnclosingFunction -Node $call | Should -BeIn @('Set-TriageRedirect', 'Undo-TriageRedirect')
+            $call.Arguments.Count            | Should -Be 3
+            $call.Arguments[0].Extent.Text   | Should -Be '$target.Variable' -Because 'the name must come from the fixed list, never from the caller'
+            $call.Arguments[2].Extent.Text   | Should -Be "'User'"
+        }
+        $gets = @($script:Ast.FindAll({ param($n)
+            $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and $n.Static -and
+            $n.Member.Extent.Text -eq 'GetEnvironmentVariable' }, $true))
+        foreach ($call in $gets) { $call.Arguments[1].Extent.Text | Should -BeIn @("'User'", "'Machine'") }
+    }
+
+    It 'manages a fixed list of variables that excludes anything system-critical' {
+        . $script:ScriptPath -ImportOnly
+        $names = @($script:TriageRedirectTargets | ForEach-Object Variable)
+        $names.Count | Should -BeGreaterThan 5
+        foreach ($forbidden in @('PATH', 'PATHEXT', 'TEMP', 'TMP', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'ComSpec', 'PSModulePath', 'SystemRoot', 'windir', 'HOME', 'HOMEDRIVE', 'HOMEPATH', 'OneDrive')) {
+            $names | Should -Not -Contain $forbidden
+        }
+    }
+
     It 'creates a file stream in exactly one place: the self-test screenshot' {
         $creates = @($script:Ast.FindAll({ param($n)
             $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and $n.Static -and
             $n.Expression.Extent.Text -eq '[System.IO.File]' }, $true))
         $creates.Count | Should -Be 1
-        Get-EnclosingFunction -Node $creates[0] | Should -Be 'Test-TriageGui'
+        Get-EnclosingFunction -Node $creates[0] | Should -Be 'Save-TriageWindowPng'
     }
 }
 

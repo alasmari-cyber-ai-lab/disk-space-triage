@@ -8,6 +8,7 @@ anything worse, and so that this can be checked by reading one file.
 | Threat | Control |
 | --- | --- |
 | The tool damages data | It contains no command that moves, copies, deletes or modifies files. Enforced by the capability allowlist test. |
+| The tool changes settings behind your back | The only setting it can change is a user environment variable from a fixed list of cache locations, and only after you tick the enabling box and confirm that change. It refuses a variable that is already set, a folder outside `<drive>:\FromC\Users`, and any path below a junction. System-critical variables (`PATH`, `TEMP`, `APPDATA` ...) are excluded by a test. Every change is logged and can be undone. |
 | The tool leaks data | No network commands or types exist in it. Only local fixed disks are scanned, and report folders on network paths are refused. The HTML report loads nothing external. CI runs a scan with outbound traffic blocked. |
 | The tool gains privileges | It needs none and refuses to run elevated. It never requests elevation and performs no token, service, registry or scheduled-task operation. |
 | A file on disk attacks the tool | File contents are never read. Paths are treated as untrusted text: they are matched, measured and written into reports as data (JSON-escaped, inserted with `textContent`). |
@@ -15,6 +16,8 @@ anything worse, and so that this can be checked by reading one file.
 | A later change quietly adds a capability | `tests/Capability.Tests.ps1` fails the build for any command, .NET type, static call, URL or write location outside the allowlist. |
 
 ## What it does not protect against
+
+- **The effect of a redirect.** After you redirect a cache, the tool that owns it downloads into the new folder; the old folder stays on the system drive until you delete it. A redirected Hugging Face folder no longer contains your sign-in token until you sign in again or copy it.
 
 - **A modified copy.** If you did not get the file from this repository, compare its SHA-256 with the published one, or read it.
 - **Running it elevated with `-AllowElevated`.** The read-only design still holds, but the scan can then see more of the machine than it needs.

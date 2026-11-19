@@ -10,6 +10,41 @@ the next, and may make the next one unnecessary.
 
 Aim for 15 to 20 percent free on the system drive, not for an empty drive.
 
+## Fix with one setting (the tool does it for you)
+
+For pure caches the window can make the change itself. On the **Fix with one
+setting** tab, tick **Allow this tool to make these changes**, select a row
+marked Ready, and choose **Apply selected**. The tool creates an empty folder
+on the other drive and sets one user variable; it shows both before you
+confirm.
+
+- The new folder keeps its name and place: `C:\Users\you\.cache\huggingface`
+  becomes `D:\FromC\Users\you\.cache\huggingface`. It can never collide with
+  a folder you already have, and its origin stays obvious.
+- Nothing is moved or deleted. Close and reopen your terminals and
+  applications, use the tool once, and check that files appear in the new
+  folder. Then delete the old folder yourself.
+- **Undo last change** removes the variable again. Every change is listed in
+  `DiskTriage_actions.csv` next to your reports.
+
+### What if a program insists on its C: path?
+
+- **Redirecting a cache does not move the program.** `pip`, Python, Ollama and
+  the rest stay installed where they are and keep running from `C:`. Only the
+  folder where they store downloads changes, and they read its location from
+  the variable every time they start. Nothing has to "run from D:".
+- **A program with no setting and a hard-coded path** (iPhone backups are the
+  usual example) is handled with a junction: move the folder to the other
+  drive, then leave a junction at the old path. The program still sees its
+  `C:` path; the data lives elsewhere. The tool does not do this for you; the
+  steps are in the Move section below.
+- **An installed program itself** must never be moved. Uninstall it and
+  install it again on the other drive.
+- **If something misbehaves after a redirect**, use Undo last change (or
+  delete the variable in Settings > System > About > Advanced system settings
+  > Environment Variables, under "User variables"). The old folder is still
+  in place, so the program carries on exactly as before.
+
 ## Redirect: the common settings
 
 Set a user environment variable without administrator rights:

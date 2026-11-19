@@ -1,4 +1,4 @@
-# Classification specification (frozen contract, revision 2)
+# Classification specification (frozen contract, revision 3)
 
 This document is the single source of truth for how the tool classifies a file
 path. The implementation and the test oracle are both derived from it,
@@ -42,6 +42,8 @@ When more than one row applies, the first applicable tier wins:
 6. **Known folders** (section 13).
 7. **Generic fallbacks** (section 14).
 8. **File-type fallback** (section 15), then **Review**.
+
+Within one tier, when the "deeper wins" rule does not decide, the first applicable row in table order wins.
 
 ## 1. Protected system locations
 
@@ -146,8 +148,8 @@ When more than one row applies, the first applicable tier wins:
 | Outlook archives | `<profile>\Documents\Outlook Files` | Move |
 | Zoom recordings | `<profile>\Documents\Zoom` | Redirect |
 | Teams (new) cache | `<profile>\AppData\Local\Packages\MSTeams_<id>\LocalCache` | Delete |
-| Teams (classic) | `<profile>\AppData\Roaming\Microsoft\Teams` | Delete |
-| Slack | `<profile>\AppData\Roaming\Slack` | Delete |
+| Teams (classic) cache | under `<profile>\AppData\Roaming\Microsoft\Teams`: everything inside a directory whose name contains the text `Cache`. The rest of that folder is profile data and falls through. | Delete |
+| Slack cache | under `<profile>\AppData\Roaming\Slack`: everything inside a directory whose name contains the text `Cache`. The rest of that folder is profile data and falls through. | Delete |
 | Discord cache | `<profile>\AppData\Roaming\discord\Cache`, `<profile>\AppData\Roaming\discord\Code Cache` (exactly these two directories) | Delete |
 | Telegram Desktop | `<profile>\AppData\Roaming\Telegram Desktop` | Redirect |
 
@@ -174,7 +176,7 @@ Named stores (tier 2):
 | Store | Default location | Bucket |
 | --- | --- | --- |
 | Firefox cache | `<profile>\AppData\Local\Mozilla\Firefox\Profiles` | Redirect |
-| Chromium-family caches (Chrome, Edge, Brave) | under a directory named `User Data`: any path whose later part contains the text `Cache` in a directory or file name (`Cache`, `Code Cache`, `GPUCache`) | Delete |
+| Chromium-family caches (Chrome, Edge, Brave) | under a directory named `User Data` that is itself somewhere below `<profile>\AppData\Local`: everything inside a directory whose name contains the text `Cache` (`Cache`, `Code Cache`, `GPUCache`). A file whose own name contains `Cache` does not count, and a `User Data` directory elsewhere is not a browser profile. | Delete |
 | Windows internet cache | `<profile>\AppData\Local\Microsoft\Windows\INetCache` | Delete |
 | User temp | `<profile>\AppData\Local\Temp` | Delete |
 | Crash dumps | `<profile>\AppData\Local\CrashDumps` | Delete |
@@ -196,6 +198,7 @@ Named stores (tier 2):
 | Location | Bucket |
 | --- | --- |
 | `X:\Program Files\`, `X:\Program Files (x86)\` (anything not covered by sections 2 to 11) | Never |
+| `<profile>\AppData\Local\Programs` (per-user installs; anything not covered by sections 2 to 11) | Never |
 
 ## 13. Known folders
 
@@ -209,7 +212,9 @@ Named stores (tier 2):
 
 | Location | Bucket |
 | --- | --- |
-| any path that, after `AppData\Local\`, contains the text `Cache` in a directory or file name | Delete |
+| `<profile>\AppData\Local\Packages\<package>\LocalCache` (exactly one directory between `Packages` and `LocalCache`): packaged-app data, not a cache despite the name. Final: the file-type fallback does not apply. New Teams (section 8) is the one exception. | Review |
+| `<profile>\AppData\Local\Microsoft\TokenBroker`: sign-in tokens. Final, as above. | Review |
+| below `AppData\Local\`: everything inside a directory whose name **begins or ends** with the text `Cache` (`Cache`, `GPUCache`, `Code Cache`, `npm-cache`, `cache2`, `CachedData`, `Caches`; but not `MyCacheStuff`). The match is on a whole directory name; a file whose own name contains `Cache` does not count. | Delete |
 | a directory named `logs` at any depth below `AppData\Local\<app>\` | Delete |
 | everything else under `AppData\Roaming\` | Never |
 
@@ -238,7 +243,12 @@ The oracle encodes the current behaviour.
 3. Named stores and file-keyed rows win over a OneDrive root that contains them (`OneDrive\Documents\Zoom` is Redirect, a `.vhdx` in OneDrive is Move), although moving things out of a synced tree needs care.
 4. A file-keyed row beats a reproducible artefact that contains it (a `.vmdk` inside `node_modules` is Move).
 5. A `.dmp` inside a named store takes that store's bucket instead of Delete.
-6. Still ambiguous, and absent from the oracle: see `tests/oracle/AMBIGUITIES.md`.
+6. Since revision 3, some real caches are no longer recognised and show as Review or Never: Windows icon and thumbnail cache files (only the file name says cache), caches of Chromium-based apps that keep `User Data` under `AppData\Roaming`, portable browsers, and cache or log folders inside `AppData\Local\Programs`. This is the safe direction; named rows can be added later.
+7. Slack and classic Teams data outside their cache directories is now Never, including large `IndexedDB` trees.
+8. Still ambiguous, and absent from the oracle: see `tests/oracle/AMBIGUITIES.md`.
 
+
+## Revision history
 
 * **Revision 2.** Written after the independent oracle review of revision 1 (see `tests/oracle/AMBIGUITIES.md` and `tests/oracle/ADJUDICATION.md`). Adds the recognition rules, tier 2b, section 9a, and tightens the rows the review showed to be ambiguous or to have unintended readings (wandb package directory, Blackmagic install path, Desktop, drive-root anchoring).
+* **Revision 3.** Written after the independent defect review of the implementation. The generic cache rules in sections 10 and 14 matched the text `Cache` anywhere, including file names and packaged-app data folders, and so marked non-caches as Delete. They now match whole directory names in bounded locations. Slack and classic Teams are narrowed from the whole profile folder to its cache directories. Per-user install paths are Never.

@@ -28,7 +28,7 @@ BeforeAll {
         'Write-Host', 'Write-Warning', 'Write-Verbose',
         'Where-Object', 'ForEach-Object', 'Select-Object', 'Sort-Object',
         'Format-Table', 'Out-Host', 'Out-Null',
-        'Test-Path', 'Join-Path', 'Get-Date', 'ConvertTo-Json',
+        'Test-Path', 'Join-Path', 'Get-Date', 'ConvertTo-Json', 'Get-Item',
         'Out-File', 'Export-Csv', 'New-Item'
     )
 
@@ -37,7 +37,7 @@ BeforeAll {
         'switch', 'hashtable', 'scriptblock', 'pscustomobject', 'Parameter', 'CmdletBinding',
         'ValidateSet', 'ValidatePattern', 'ValidateRange',
         'Security.Principal.WindowsIdentity', 'Security.Principal.WindowsBuiltInRole',
-        'System.Action', 'System.StringComparison',
+        'System.Action', 'System.StringComparison', 'System.Globalization.CultureInfo',
         'System.IO.FileAttributes', 'System.IO.Path', 'System.IO.File', 'System.IO.IOException',
         'System.UnauthorizedAccessException', 'System.Security.SecurityException',
         'System.Management.Automation.WildcardOptions', 'System.Text.RegularExpressions.RegexOptions',
@@ -58,10 +58,23 @@ BeforeAll {
         'System.Windows.Media.Imaging.RenderTargetBitmap', 'System.Windows.Media.Imaging.PngBitmapEncoder'
     )
 
+    # Every instance method the script calls. Anything that could write, delete,
+    # move, copy, open or execute (Delete, MoveTo, CopyTo, Open*, Create*, Start,
+    # InvokeScript ...) is absent, so adding such a call fails the build.
+    $script:AllowedInstanceMethods = @(
+        'Add', 'Add_Click', 'Add_Closing', 'Add_SelectionChanged', 'AppendLine', 'Arrange', 'Contains',
+        'ContainsKey', 'Dequeue', 'Dispose', 'EndsWith', 'Enqueue', 'EnumerateDirectories', 'EnumerateFiles',
+        'FindName', 'FindResource', 'GetEnumerator', 'Invoke', 'IsInRole', 'IsMatch', 'LastIndexOf', 'Measure',
+        'Render', 'Replace', 'Save', 'ShowDialog', 'StartsWith', 'Substring', 'ToArray', 'ToLowerInvariant',
+        'ToString', 'ToUpper', 'Trim', 'TrimEnd', 'UpdateLayout'
+    )
+
     # Static members allowed on the types that could otherwise read, write or reach out.
     $script:AllowedStaticMembers = @{
         'System.IO.File'                    = @('Create')
-        'System.IO.Path'                    = @('GetFullPath', 'GetPathRoot')
+        'System.IO.Path'                    = @('GetFullPath', 'GetDirectoryName')
+        'scriptblock'                       = @()
+        'System.Globalization.CultureInfo'  = @('InvariantCulture')
         'Environment'                       = @('GetFolderPath')
         'System.Windows.Markup.XamlReader'  = @('Parse')
         'System.Windows.Clipboard'          = @('SetText')
@@ -158,6 +171,50 @@ Describe '.NET surface' {
             if ($script:AllowedStaticMembers[$type] -notcontains $member) { "[$type]::$member (line $($call.Extent.StartLineNumber))" }
         }
         @($bad) | Should -BeNullOrEmpty
+    }
+
+    It 'calls only allowlisted instance methods (nothing that writes, deletes, moves, opens or executes)' {
+        $calls = @($script:Ast.FindAll({ param($n)
+            $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and -not $n.Static }, $true))
+        $bad = foreach ($call in $calls) {
+            $name = $call.Member.Extent.Text
+            if ($script:AllowedInstanceMethods -notcontains $name) { ".$name() (line $($call.Extent.StartLineNumber))" }
+        }
+        @($bad | Sort-Object -Unique) | Should -BeNullOrEmpty
+    }
+
+    It 'uses Dispatcher.Invoke only with an empty action, and Save only on the screenshot encoder' {
+        $calls = @($script:Ast.FindAll({ param($n)
+            $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and -not $n.Static -and
+            ($n.Member.Extent.Text -eq 'Invoke' -or $n.Member.Extent.Text -eq 'Save') }, $true))
+        foreach ($call in $calls) {
+            if ($call.Member.Extent.Text -eq 'Invoke') {
+                ($call.Extent.Text -replace '\s+', ' ') | Should -Match 'Dispatcher\.Invoke\(\[System\.Action\]\{ \}, \[System\.Windows\.Threading\.DispatcherPriority\]::(Background|ApplicationIdle)\)$'
+            } else {
+                Get-EnclosingFunction -Node $call | Should -Be 'Test-TriageGui'
+            }
+        }
+    }
+
+    It 'has no output redirection to files' {
+        @($script:Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FileRedirectionAst] }, $true)).Count | Should -Be 0
+    }
+
+    It 'never touches the engine internals that can run arbitrary code' {
+        $vars = @($script:Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) |
+            ForEach-Object { $_.VariablePath.UserPath })
+        foreach ($name in @('ExecutionContext', 'PSCmdlet', 'Host', 'MyInvocation')) {
+            $vars | Should -Not -Contain $name
+        }
+    }
+
+    It 'has a window definition with no code, object providers or external sources' {
+        $xaml = @($script:Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) |
+            Where-Object { $_.Value -like '<Window*' })
+        $xaml.Count | Should -Be 1
+        foreach ($word in @('ObjectDataProvider', 'x:Type', 'x:Static', 'x:Code', 'x:Class', 'clr-namespace', 'Source=', 'NavigateUri', 'Hyperlink', 'WebBrowser', 'Frame ', 'MediaElement', '<Image')) {
+            $xaml[0].Value.IndexOf($word, [System.StringComparison]::OrdinalIgnoreCase) | Should -Be -1 -Because "$word must not appear in the window XAML"
+        }
     }
 
     It 'creates a file stream in exactly one place: the self-test screenshot' {

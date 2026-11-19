@@ -3,8 +3,8 @@
 Work through the buckets in this order. Each step is cheaper and safer than
 the next, and may make the next one unnecessary.
 
-1. **Delete** - nothing to verify, nothing to undo.
-2. **Redirect** - set the setting, confirm it took effect, then delete the old folder.
+1. **Delete** - reproducible things. Read the Why column first: an environment needs its package list exported, and `node_modules` needs a lockfile, before it can be rebuilt.
+2. **Redirect** - change the setting and confirm it took effect. Then deal with the old folder: **delete it only if the Why column calls it a cache or re-downloadable; otherwise move its contents.** Recordings, game worlds, run logs and container data are yours, not caches.
 3. **Move** - copy, verify, rename the original, delete it a few days later.
 4. **Administrator checklist** - once, by hand.
 
@@ -30,27 +30,31 @@ It applies to newly opened terminals and applications.
 | `yarn cache-folder`, `pnpm store-dir` | `yarn config set cache-folder ...`, `pnpm config set store-dir ...`. |
 | `NUGET_PACKAGES`, `GRADLE_USER_HOME`, `CARGO_HOME`, `GOMODCACHE`, `COMPOSER_CACHE_DIR`, `GEM_HOME`, `VAGRANT_HOME`, `ANDROID_SDK_ROOT`, `ANDROID_AVD_HOME` | `setx NAME "D:\..."`. |
 | `localRepository` | In `%USERPROFILE%\.m2\settings.xml`: `<localRepository>D:\caches\m2</localRepository>`. |
-| `Settings > Resources > Disk image location` | Docker Desktop. Run `docker system prune -a` first; it often frees most of the space on its own. |
+| `Settings > Resources > Disk image location` | Docker Desktop moves the data for you when you change this. To shrink it first, look with `docker system df`, then remove what you do not need (`docker image prune`). Be careful with `docker system prune -a`: it deletes every stopped container, every unused image and the build cache. Never delete the folder by hand. |
 | `wsl --manage --move` | `wsl --shutdown`, then `wsl --manage <distro> --move D:\WSL\<distro>`. |
 | `Shrink cached period, or ForceOSTPath` | Outlook: File > Account Settings > Change > Mail to keep offline. Shrinking is easier than moving. |
 | `Settings > Recording` | Zoom: change where local recordings are stored. |
 | `Preferences > Media Cache` | Adobe Premiere / After Effects. The same dialog can delete unused cache. |
 | `browser.cache.disk.parent_directory` | Firefox, in `about:config`. |
 
-For a cache, do not copy the old contents. Set the variable, delete the old
-folder, and let it refill in the new place.
+For a true cache (pip, npm, conda packages, Hugging Face downloads), do not
+copy the old contents: set the variable, confirm it, delete the old folder,
+and let it refill in the new place.
 
-Models and weights you trained yourself are not caches. Move them like any
-other data.
+For everything else in the Redirect list, the old folder holds data. Zoom
+recordings, Minecraft worlds, Weights and Biases runs, Docker volumes, the
+DaVinci Resolve project library, Telegram data and the iTunes library must be
+moved (ideally by the application itself), never deleted. Models and weights
+you trained yourself are not caches either.
 
 ## Delete
 
 | "What to do" | Meaning |
 | --- | --- |
-| `Reinstall from lockfile` | `node_modules`. Delete it; `npm ci` rebuilds it. |
-| `Recreate on D:` | Virtual and conda environments. They store absolute paths and break when copied. Export (`pip freeze`, `conda env export`), delete, recreate. |
-| `Regenerates` | Application caches. Close the application first. |
-| `TEMP / TMP` | Temporary files. Settings > System > Storage > Temporary files does this safely. |
+| `Reinstall from lockfile` | `node_modules`. If the project has a `package-lock.json`, delete the folder; `npm ci` rebuilds it. Without a lockfile, keep it. |
+| `Recreate on the other drive`, `Export, then recreate on the other drive` | Virtual and conda environments. They store absolute paths and break when copied. First save the package list (`pip freeze > requirements.txt`, `conda env export > env.yml`), then delete, then recreate. |
+| `Regenerates` | Application caches. Close the application first. For the Office document cache, let Office finish uploading your changes before clearing it. |
+| `TEMP / TMP` | Temporary files. Settings > System > Storage > Temporary files does this safely. Leave the **Downloads** box unticked there. |
 | `Empty Recycle Bin` | Right-click the Recycle Bin. |
 
 ## Move
@@ -59,13 +63,15 @@ other data.
 | --- | --- |
 | `Properties > Location tab` | Right-click Downloads, Documents, Pictures, Videos or Music > Properties > Location > Move. Point it at a named folder such as `D:\Users\you\Downloads`, never at the root of the drive. |
 | `Explorer move` | Ordinary data files. Move them, then fix any project that referenced the old path. |
-| `Steam > Storage > Move` | Add a library folder on D: in Steam, then move each game. Other launchers: use their own move function, or reinstall to D:. |
-| `Move + mklink /J` | iPhone backups have no setting. Close the Apple software, move the `Backup` folder to D:, then `mklink /J "<original path>" "D:\AppleBackup"`. |
+| `Steam > Storage > Move` | Add a library folder on the other drive in Steam, then move each game. Other launchers: use their own move function, or reinstall to D:. |
+| `Move + mklink /J` | iPhone backups have no setting. Close the Apple software, move the `Backup` folder to D:, then, in a Command Prompt (not PowerShell), `mklink /J "<original path>" "D:\AppleBackup"`. |
 | `Owning tool only`, `Machine > Move`, `Hyper-V Manager > Move` | Virtual machines. Shut the machine down and move it with its own tool. |
 | `Files On-Demand` | OneDrive. Do not move the folder. Right-click large folders > Free up space. |
 
-To undo a junction, use `rmdir "<link>"`. Never delete a junction with
-`del /s` or Shift+Delete: that can remove the files at the other end.
+To undo a junction, open a Command Prompt (not PowerShell) and run
+`rmdir "<link>"`, or from PowerShell `cmd /c rmdir "<link>"`. Never use
+PowerShell's own `rmdir`/`Remove-Item`, `del /s` or Shift+Delete on a
+junction: they can remove the files at the other end.
 
 ## Never and Review
 

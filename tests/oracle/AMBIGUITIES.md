@@ -1,35 +1,47 @@
-# Oracle ambiguities (against SPEC.md revision 2)
+# Oracle ambiguities (against SPEC.md revision 3)
 
-Cases left out of `expected_classifications.csv` because revision 2 still does
-not determine a single bucket. Derived from `docs/SPEC.md` only. All 13
-revision-1 entries are resolved and now have rows in the CSV.
+Cases left out of `expected_classifications.csv` because revision 3 still does
+not determine a single bucket. Derived from `docs/SPEC.md` only. C1 to C5 are
+carried over unchanged from revision 2 (there B1 to B5); C6 and C7 are new.
 
-## B1. `logs` directly inside `AppData\Local`
+## C1. `logs` directly inside `AppData\Local`
 
 * Path: `C:\Users\khalid\AppData\Local\logs\updater.log`
 * Candidates: Delete versus Review.
-* Tension: "a directory named `logs` at any depth below `AppData\Local\<app>\`". Here `logs` occupies the `<app>` position itself, so it is not below an app directory, yet it is a logs directory under AppData\Local.
+* Tension: "a directory named `logs` at any depth below `AppData\Local\<app>\`". Here `logs` occupies the `<app>` position itself.
 
-## B2. File-keyed rows and a dotfile name
+## C2. File-keyed rows and a dotfile name
 
 * Paths: `D:\dumps\.dmp`, `D:\VMs\.vhdx`
 * Candidates: Delete / Move versus Review.
-* Tension: the rows read "Memory dump files (`.dmp`)" and "Any other virtual disk (`.vhdx`, ...)" without saying they key on the extension; the extension definition says a name whose only `.` is its first character has none.
+* Tension: the file-keyed rows read "Memory dump files (`.dmp`)" and "Any other virtual disk (`.vhdx`, ...)" without saying they key on the extension; by the extension definition these names have none.
 
-## B3. Is the WSL row tier 2 or tier 2b
+## C3. Is the WSL row tier 2 or tier 2b
 
 * Path: `C:\Users\khalid\AppData\Local\Temp\restore\AppData\Local\Packages\CanonicalGroupLimited.Ubuntu_79rhkp1fndgsc\LocalState\ext4.vhdx`
-* Candidates: Redirect (WSL row is a tier 2 named store and is deeper than user temp) versus Delete (WSL row is file-keyed, so user temp, a tier 2 store, excludes it).
-* Tension: tier 2b is described as "virtual disks in section 5", which could include the WSL row ("any `.vhdx` file under ..."), but only the "Any other virtual disk" row is marked "(file-keyed, tier 2b)". The CSV treats the WSL row as tier 2 and only includes cases where both readings agree.
+* Candidates: Redirect (WSL row is a tier 2 store, deeper than user temp) versus Delete (WSL row is file-keyed, so user temp excludes it).
+* Tension: tier 2b is "virtual disks in section 5", which could include the WSL row, but only the "Any other virtual disk" row is marked "(file-keyed, tier 2b)".
 
-## B4. A directory named exactly `Previews.lrdata`
+## C4. A directory named exactly `Previews.lrdata`
 
 * Path: `D:\Photos\Catalog\Previews.lrdata\previews.db`
 * Candidates: Move versus Review.
-* Tension: "a `... Previews.lrdata` directory" does not say whether the leading text is required.
+* Tension: "a `... Previews.lrdata` directory" does not say whether leading text is required.
 
-## B5. Degenerate OneDrive business names
+## C5. Degenerate OneDrive business names
 
-* Paths: `C:\Users\khalid\OneDrive - \notes.txt` is not a legal name, but `C:\Users\khalid\OneDrive -Contoso\notes.txt` and `C:\Users\khalid\OneDrive  -  Contoso\notes.txt` are
+* Paths: `C:\Users\khalid\OneDrive -Contoso\notes.txt`, `C:\Users\khalid\OneDrive  -  Contoso\notes.txt`
 * Candidates: Never versus Review.
-* Tension: "`OneDrive - <anything>`" does not say how strict the ` - ` separator is. (`OneDrive-Contoso`, with no spaces at all, is in the CSV as Review.)
+* Tension: "`OneDrive - <anything>`" does not say how strict the ` - ` separator is.
+
+## C6. Other section 14 rows nested inside a "final Review" location
+
+* Paths: `C:\Users\khalid\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.11_qbz5n2kfra8p0\LocalCache\Local\pip\Cache\http-v2\a\1\a1c9f0d2`, `C:\Users\khalid\AppData\Local\Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalCache\logs\terminal.log`, `C:\Users\khalid\AppData\Local\Microsoft\TokenBroker\logs\broker.log`
+* Candidates: Review versus Delete.
+* Tension: the two Review rows are "Final: the file-type fallback does not apply", which only names the file-type fallback. The spec gives no order among rows of the same tier, so it does not say whether a `Cache`-named or `logs` directory *nested inside* LocalCache or TokenBroker is Delete. (The CSV does include `TokenBroker\Cache\*.tbres` and files directly under `LocalCache` as Review: the Review rows would have no effect at all if the Cache rule beat them on the very directory they name.)
+
+## C7. Zero directories between `Packages` and `LocalCache`
+
+* Path: `C:\Users\khalid\AppData\Local\Packages\LocalCache\state.bin`
+* Candidates: Delete (not "exactly one directory between", and LocalCache ends with Cache) versus Review.
+* Tension: literal reading gives Delete, but `LocalCache` here would itself be the `<package>` directory; the row does not address it. Not a realistic path; listed for completeness.

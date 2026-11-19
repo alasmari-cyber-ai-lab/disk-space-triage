@@ -103,13 +103,30 @@ Describe 'Scan containment' {
         { Invoke-TriageScan -SourceDrive $script:Drive -MinSizeMB 1 -SkipDefaultRoots -AdditionalRoot "${other}:\nowhere" -WarningAction SilentlyContinue } |
             Should -Throw '*nothing to scan*'
     }
-    It 'stops when cancelled and says so' {
-        $r = Invoke-TriageScan -SourceDrive $script:Drive -MinSizeMB 1 -SkipDefaultRoots -AdditionalRoot "$script:Root" `
-            -OnProgress { $script:TriageCancel = $true }
-        # Progress fires every 25 folders; the fixture is smaller, so cancel may never trigger. Either way the flag is consistent.
-        $r.Cancelled | Should -BeIn @($true, $false)
+    It 'keeps a drive root as a root and drops everything inside it' {
+        $roots = @(Get-ScanRoots -Drive $script:Drive -Extra "${script:Drive}:\", "$script:Root\proj" -SkipDefaultRoots)
+        $roots.Count | Should -Be 1
+        $roots[0]    | Should -Be "${script:Drive}:\"
     }
-    It 'leaves the scanned tree untouched' {
+    It 'refuses relative folders' {
+        @(Get-ScanRoots -Drive $script:Drive -Extra '.\proj' -SkipDefaultRoots -WarningAction SilentlyContinue).Count | Should -Be 0
+    }
+    It 'reports folders beyond the depth limit instead of dropping them silently' {
+        $r = Invoke-TriageScan -SourceDrive $script:Drive -MinSizeMB 1 -MaxDepth 1 -SkipDefaultRoots -AdditionalRoot "$script:Root\proj"
+        $r.DepthLimitedFolders | Should -BeGreaterThan 0
+    }
+    It 'counts the junction it did not follow' {
+        $r = Invoke-TriageScan -SourceDrive $script:Drive -MinSizeMB 1 -SkipDefaultRoots -AdditionalRoot "$script:Root\scan"
+        $r.LinkFoldersSkipped | Should -Be 1
+    }
+    It 'gives each store its own row even when the instruction text is shared' {
+        Initialize-TriageRules
+        $a = Get-TriageClassification -Path 'C:\Users\t\AppData\Local\D3DSCache\x.bin'
+        $b = Get-TriageClassification -Path 'C:\Users\t\AppData\Local\CrashDumps\x.bin'
+        $a.Mechanism | Should -Be $b.Mechanism
+        $a.Note      | Should -Not -Be $b.Note
+    }
+    It 'leaves the scanned tree untouched (same names, sizes and timestamps)' {
         $before = @(Get-ChildItem -LiteralPath "$script:Root\proj" -Recurse -File | ForEach-Object { "$($_.FullName)|$($_.Length)|$($_.LastWriteTimeUtc.Ticks)" })
         [void](Invoke-TriageScan -SourceDrive $script:Drive -MinSizeMB 1 -SkipDefaultRoots -AdditionalRoot "$script:Root\proj")
         $after  = @(Get-ChildItem -LiteralPath "$script:Root\proj" -Recurse -File | ForEach-Object { "$($_.FullName)|$($_.Length)|$($_.LastWriteTimeUtc.Ticks)" })
@@ -123,6 +140,12 @@ Describe 'Report directory validation' {
     }
     It 'refuses a junction' {
         { Resolve-ReportDirectory -Requested "$script:Root\scan\link" } | Should -Throw '*junction*'
+    }
+    It 'refuses a folder below a junction' {
+        { Resolve-ReportDirectory -Requested "$script:Root\scan\link\reports" } | Should -Throw '*junction*'
+    }
+    It 'refuses a relative path' {
+        { Resolve-ReportDirectory -Requested '.\reports' } | Should -Throw '*full path*'
     }
     It 'refuses a drive that is not a local fixed disk' {
         $letters = [System.IO.DriveInfo]::GetDrives() | ForEach-Object { $_.Name.Substring(0, 1) }

@@ -80,7 +80,7 @@ param(
     [ValidatePattern('^[A-Za-z]$')] [string]   $DestinationDrive = 'D',
     [ValidateRange(1, 1048576)]     [int]      $MinSizeMB        = 100,
     [ValidateRange(1, 5000)]        [int]      $TopCount         = 300,
-    [ValidateRange(1, 64)]          [int]      $MaxDepth         = 14,
+    [ValidateRange(1, 64)]          [int]      $MaxDepth         = 24,
                                     [string]   $ReportDirectory,
                                     [string[]] $AdditionalRoot   = @(),
                                     [switch]   $SkipDefaultRoots,
@@ -130,23 +130,23 @@ $script:TriageRules = @(
     New-TriageRule '*\anaconda3\pkgs\*'               'Redirect' 'pkgs_dirs in .condarc' 'conda package cache'
     New-TriageRule '*\miniconda3\pkgs\*'              'Redirect' 'pkgs_dirs in .condarc' 'conda package cache'
     New-TriageRule '*\AppData\Local\conda\*'          'Redirect' 'pkgs_dirs in .condarc' 'conda package cache'
-    New-TriageRule '*\anaconda3\envs\*'               'Delete'   'Recreate on D:'        'conda environment; export and recreate, never copy'
-    New-TriageRule '*\miniconda3\envs\*'              'Delete'   'Recreate on D:'        'conda environment; export and recreate, never copy'
+    New-TriageRule '*\anaconda3\envs\*'               'Delete'   'Export, then recreate on the other drive' 'conda environment; export it first (conda env export), never copy'
+    New-TriageRule '*\miniconda3\envs\*'              'Delete'   'Export, then recreate on the other drive' 'conda environment; export it first (conda env export), never copy'
 
     # --- ML and AI model stores ---
-    New-TriageRule '*\.cache\huggingface\*'           'Redirect' 'HF_HOME'               'Hugging Face hub, datasets and metrics caches'
+    New-TriageRule '*\.cache\huggingface\*'           'Redirect' 'HF_HOME'               'Hugging Face cache. Re-downloadable; safe to delete after redirecting'
     New-TriageRule '*\.cache\torch\*'                 'Redirect' 'TORCH_HOME'            'PyTorch hub cache'
     New-TriageRule '*\.keras\*'                       'Redirect' 'KERAS_HOME'            'Keras models and datasets'
     New-TriageRule '*\tensorflow_datasets\*'          'Redirect' 'TFDS_DATA_DIR'         'TensorFlow Datasets'
     New-TriageRule '*\nltk_data\*'                    'Redirect' 'NLTK_DATA'             'NLTK corpora'
-    New-TriageRule '*\.ollama\models\*'               'Redirect' 'OLLAMA_MODELS'         'Ollama model store'
-    New-TriageRule '*\.lmstudio\models\*'             'Redirect' 'Settings > Models directory' 'LM Studio models'
+    New-TriageRule '*\.ollama\models\*'               'Redirect' 'OLLAMA_MODELS'         'Ollama models. Re-downloadable; move them to avoid downloading again'
+    New-TriageRule '*\.lmstudio\models\*'             'Redirect' 'Settings > Models directory' 'LM Studio models. Re-downloadable; move them to avoid downloading again'
     New-TriageRule '*\.triton\*'                      'Redirect' 'TRITON_CACHE_DIR'      'Triton kernel cache'
     New-TriageRule '*\.dvc\cache\*'                   'Redirect' 'dvc cache dir'         'DVC cache'
     # wandb and mlruns can nest; the deeper directory wins. A wandb directory
     # inside site-packages is the installed package, not run data.
     New-TriageRule 're:\\mlruns\\(?!.*\\wandb\\)'  'Move'     'MLflow artifact root' 'MLflow runs'
-    New-TriageRule 're:^(?:(?!\\site-packages\\).)*?\\wandb\\' 'Redirect' 'WANDB_DIR' 'Weights and Biases run data'
+    New-TriageRule 're:^(?:(?!\\site-packages\\).)*?\\wandb\\' 'Redirect' 'WANDB_DIR' 'Weights and Biases run data. Your data: move it, do not delete'
     New-TriageRule 're:\\mlruns\\'                   'Move'     'MLflow artifact root' 'MLflow runs'
 
     # --- Package managers and developer tools ---
@@ -162,32 +162,32 @@ $script:TriageRules = @(
     New-TriageRule '*\.gem\*'                         'Redirect' 'GEM_HOME'              'RubyGems'
     New-TriageRule '*\scoop\apps\*'                   'Redirect' 'SCOOP'                 'Scoop apps'
     New-TriageRule '*\AppData\Local\Android\Sdk\*'    'Redirect' 'ANDROID_SDK_ROOT'      'Android SDK'
-    New-TriageRule '*\.android\avd\*'                 'Redirect' 'ANDROID_AVD_HOME'      'Android emulator images'
-    New-TriageRule '*\.vscode\extensions\*'           'Redirect' '--extensions-dir'      'VS Code extensions'
+    New-TriageRule '*\.android\avd\*'                 'Redirect' 'ANDROID_AVD_HOME'      'Android emulator images. Move them or recreate the devices'
+    New-TriageRule '*\.vscode\extensions\*'           'Redirect' 'code --extensions-dir' 'VS Code extensions'
     New-TriageRule '*\AppData\Local\Unity\caches\*'   'Redirect' 'Preferences > GI Cache' 'Unity caches'
     New-TriageRule '*\AppData\Local\UnrealEngine\Common\DerivedDataCache\*' 'Redirect' 'UE-LocalDataCachePath' 'Unreal derived data cache'
     New-TriageRule '*\.vagrant.d\*'                   'Redirect' 'VAGRANT_HOME'          'Vagrant boxes'
     New-TriageRule '?:\ProgramData\Microsoft\VisualStudio\Packages\*' 'Delete' 'Visual Studio Installer' 'Visual Studio package cache'
 
     # --- Containers and virtual machines ---
-    New-TriageRule '*\AppData\Local\Docker\*'         'Redirect' 'Settings > Resources > Disk image location' 'Docker Desktop data; prune first'
+    New-TriageRule '*\AppData\Local\Docker\*'         'Redirect' 'Settings > Resources > Disk image location' 'Docker Desktop data: images, containers and volumes. Move it with this setting; do not delete it'
     New-TriageRule '*\AppData\Local\Packages\*\LocalState\*.vhdx' 'Redirect' 'wsl --manage --move' 'WSL distribution disk'
     New-TriageRule '?:\ProgramData\Microsoft\Windows\Hyper-V\*' 'Move' 'Hyper-V Manager > Move' 'Hyper-V virtual machine (needs administrator)'
     New-TriageRule '?:\Users\Public\Documents\Hyper-V\*' 'Move' 'Hyper-V Manager > Move' 'Hyper-V virtual machine (needs administrator)'
     New-TriageRule '*\VirtualBox VMs\*'               'Move'     'Machine > Move'        'VirtualBox virtual machine'
-    New-TriageRule '*\Documents\Virtual Machines\*'   'Move'     'Reopen .vmx from D:'   'VMware virtual machine'
+    New-TriageRule '*\Documents\Virtual Machines\*'   'Move'     'Move the folder, reopen the .vmx' 'VMware virtual machine'
 
     # --- Games ---
     New-TriageRule '*\steamapps\shadercache\*'        'Delete'   'Regenerates'           'Steam shader cache'
     New-TriageRule '*\steamapps\downloading\*'        'Delete'   'Regenerates'           'Interrupted Steam downloads'
     New-TriageRule '*\steamapps\*'                    'Move'     'Steam > Storage > Move' 'Steam game library'
-    New-TriageRule '?:\Program Files\Epic Games\*'    'Move'     'Reinstall to D:'       'Epic Games has no move function'
-    New-TriageRule '?:\Program Files (x86)\Epic Games\*' 'Move'  'Reinstall to D:'       'Epic Games has no move function'
+    New-TriageRule '?:\Program Files\Epic Games\*'    'Move'     'Reinstall on the other drive' 'Epic Games has no move function'
+    New-TriageRule '?:\Program Files (x86)\Epic Games\*' 'Move'  'Reinstall on the other drive' 'Epic Games has no move function'
     New-TriageRule '?:\Program Files (x86)\GOG Galaxy\Games\*' 'Move' 'Manage installation > Move' 'GOG Galaxy game'
     New-TriageRule '?:\Program Files (x86)\Battle.net\*' 'Move'  'Locate game after move' 'Battle.net game'
-    New-TriageRule '?:\Program Files (x86)\Ubisoft\*' 'Move'     'Reinstall to D:'       'Ubisoft Connect game'
+    New-TriageRule '?:\Program Files (x86)\Ubisoft\*' 'Move'     'Reinstall on the other drive' 'Ubisoft Connect game'
     New-TriageRule '?:\Program Files\WindowsApps\*'   'Move'     'Settings > Apps > Move' 'Microsoft Store or Xbox app'
-    New-TriageRule '*\AppData\Roaming\.minecraft\*'   'Redirect' 'Launcher > game directory' 'Minecraft Java'
+    New-TriageRule '*\AppData\Roaming\.minecraft\*'   'Redirect' 'Launcher > game directory' 'Minecraft Java, including your worlds. Your data: move it, do not delete'
     New-TriageRule '*\AppData\Local\NVIDIA\DXCache\*' 'Delete'   'Regenerates'           'GPU shader cache'
     New-TriageRule '*\AppData\Local\AMD\DxCache\*'    'Delete'   'Regenerates'           'GPU shader cache'
     New-TriageRule '*\AppData\Local\D3DSCache\*'      'Delete'   'Regenerates'           'DirectX shader cache'
@@ -199,23 +199,24 @@ $script:TriageRules = @(
     New-TriageRule '*\AppData\Roaming\Adobe\Common\Media Cache\*' 'Redirect' 'Preferences > Media Cache' 'Adobe media cache; often very large'
     New-TriageRule '*\AppData\Local\Adobe\CameraRaw\Cache\*' 'Redirect' 'Preferences > Camera Raw' 'Camera Raw cache'
     New-TriageRule '* Previews.lrdata\*'              'Move'     'Move the catalog, reopen it' 'Lightroom previews'
-    New-TriageRule '*\AppData\Roaming\Blackmagic Design\*' 'Redirect' 'Project Settings > Working Folders' 'DaVinci Resolve cache'
-    New-TriageRule '*\AppData\Local\Blackmagic Design\*' 'Redirect' 'Project Settings > Working Folders' 'DaVinci Resolve cache'
-    New-TriageRule '*\AppData\Local\Microsoft\Office\*\OfficeFileCache\*' 'Delete' 'Regenerates' 'Office document cache'
+    New-TriageRule '*\AppData\Roaming\Blackmagic Design\*' 'Redirect' 'Project Settings > Working Folders' 'DaVinci Resolve data. May include your project library: move it, do not delete'
+    New-TriageRule '*\AppData\Local\Blackmagic Design\*' 'Redirect' 'Project Settings > Working Folders' 'DaVinci Resolve data. May include your project library: move it, do not delete'
+    New-TriageRule '*\AppData\Local\Microsoft\Office\*\OfficeFileCache\*' 'Delete' 'Regenerates' 'Office document cache. Let Office finish uploading before clearing it'
     New-TriageRule '*\AppData\Local\Plex Media Server\*' 'Move'  'Move, then repoint in the registry' 'Plex metadata'
     New-TriageRule '*\AppData\Local\Spotify\Storage\*' 'Redirect' 'Settings > Storage'  'Spotify offline songs'
-    New-TriageRule '*\Music\iTunes\iTunes Media\*'    'Redirect' 'Preferences > Files'   'iTunes / Apple Music library'
+    New-TriageRule '*\Music\iTunes\iTunes Media\*'    'Redirect' 'Preferences > Files'   'iTunes / Apple Music library. Your data: let the app consolidate it to the new place'
 
     # --- Communication ---
     New-TriageRule '*\AppData\Local\Microsoft\Outlook\*.ost' 'Redirect' 'Shrink cached period, or ForceOSTPath' 'Outlook offline mailbox'
     New-TriageRule '*\Documents\Outlook Files\*'      'Move'     'Account Settings > Data Files' 'Outlook archives'
-    New-TriageRule '*\Documents\Zoom\*'               'Redirect' 'Settings > Recording'  'Zoom local recordings'
+    New-TriageRule '*\Documents\Zoom\*'               'Redirect' 'Settings > Recording'  'Zoom recordings. Your data: after changing the setting, move them, do not delete'
     New-TriageRule '*\AppData\Local\Packages\MSTeams_*\LocalCache\*' 'Delete' 'Regenerates' 'Teams cache'
-    New-TriageRule '*\AppData\Roaming\Microsoft\Teams\*' 'Delete' 'Regenerates'          'Teams (classic) cache'
-    New-TriageRule '*\AppData\Roaming\Slack\*'        'Delete'   'Regenerates'           'Slack cache'
+    # Only the cache directories; the rest of these folders is profile data.
+    New-TriageRule 're:\\AppData\\Roaming\\Microsoft\\Teams\\(?:[^\\]+\\)*?[^\\]*cache[^\\]*\\' 'Delete' 'Regenerates' 'Teams (classic) cache'
+    New-TriageRule 're:\\AppData\\Roaming\\Slack\\(?:[^\\]+\\)*?[^\\]*cache[^\\]*\\' 'Delete' 'Regenerates' 'Slack cache'
     New-TriageRule '*\AppData\Roaming\discord\Cache\*' 'Delete'  'Regenerates'           'Discord cache'
     New-TriageRule '*\AppData\Roaming\discord\Code Cache\*' 'Delete' 'Regenerates'       'Discord cache'
-    New-TriageRule '*\AppData\Roaming\Telegram Desktop\*' 'Redirect' 'Settings > Advanced > Data and storage' 'Telegram media cache'
+    New-TriageRule '*\AppData\Roaming\Telegram Desktop\*' 'Redirect' 'Settings > Advanced > Data and storage' 'Telegram Desktop data. Change the folder in the app; do not delete this one by hand'
 
     # --- Mobile backups and sync caches ---
     New-TriageRule '*\Apple\MobileSync\Backup\*'      'Move'     'Move + mklink /J'      'iPhone / iPad backup; no setting exists'
@@ -225,7 +226,8 @@ $script:TriageRules = @(
 
     # --- Browsers, temp and crash data ---
     New-TriageRule '*\AppData\Local\Mozilla\Firefox\Profiles\*' 'Redirect' 'browser.cache.disk.parent_directory' 'Firefox cache'
-    New-TriageRule '*\User Data\*Cache*'              'Delete'   'Regenerates'           'Browser cache'
+    # A cache-named directory inside a browser "User Data" folder below AppData\Local.
+    New-TriageRule 're:\\AppData\\Local\\(?:[^\\]+\\)*?User Data\\(?:[^\\]+\\)*?[^\\]*cache[^\\]*\\' 'Delete' 'Regenerates' 'Browser cache'
     New-TriageRule '*\AppData\Local\Microsoft\Windows\INetCache\*' 'Delete' 'Regenerates' 'Windows internet cache'
     New-TriageRule '*\AppData\Local\Temp\*'           'Delete'   'TEMP / TMP'            'User temporary files'
     New-TriageRule '*\AppData\Local\CrashDumps\*'     'Delete'   'Regenerates'           'Crash dumps'
@@ -240,23 +242,24 @@ $script:TriageRules = @(
     New-TriageRule '*.dmp'                            'Delete'   'Startup and Recovery'  'Memory dump'
 
     # === TIER 3: reproducible artefacts ======================================
-    New-TriageRule '*\node_modules\*'                 'Delete'   'Reinstall from lockfile' 'Reproducible; never copy'
-    New-TriageRule '*\.venv\*'                        'Delete'   'Recreate on D:'        'Virtual environment; embeds absolute paths'
-    New-TriageRule '*\venv\Scripts\*'                 'Delete'   'Recreate on D:'        'Virtual environment; embeds absolute paths'
-    New-TriageRule '*\venv\Lib\*'                     'Delete'   'Recreate on D:'        'Virtual environment; embeds absolute paths'
-    New-TriageRule '*\venv\Include\*'                 'Delete'   'Recreate on D:'        'Virtual environment; embeds absolute paths'
+    New-TriageRule '*\node_modules\*'                 'Delete'   'Reinstall from lockfile' 'node_modules; needs a package-lock file to rebuild, never copy'
+    New-TriageRule '*\.venv\*'                        'Delete'   'Recreate on the other drive' 'Virtual environment; save requirements first (pip freeze), never copy'
+    New-TriageRule '*\venv\Scripts\*'                 'Delete'   'Recreate on the other drive' 'Virtual environment; save requirements first (pip freeze), never copy'
+    New-TriageRule '*\venv\Lib\*'                     'Delete'   'Recreate on the other drive' 'Virtual environment; save requirements first (pip freeze), never copy'
+    New-TriageRule '*\venv\Include\*'                 'Delete'   'Recreate on the other drive' 'Virtual environment; save requirements first (pip freeze), never copy'
     New-TriageRule '*\__pycache__\*'                  'Delete'   'Regenerates'           'Compiled Python bytecode'
-    New-TriageRule '*\target\debug\*'                 'Delete'   'CARGO_TARGET_DIR'      'Rust build output'
-    New-TriageRule '*\target\release\*'               'Delete'   'CARGO_TARGET_DIR'      'Rust build output'
+    New-TriageRule '*\target\debug\*'                 'Delete'   'CARGO_TARGET_DIR'      'Rust build output, if this is a Cargo project'
+    New-TriageRule '*\target\release\*'               'Delete'   'CARGO_TARGET_DIR'      'Rust build output, if this is a Cargo project'
 
     # === TIER 4: cloud-sync roots (directly inside a profile) ================
     New-TriageRule 're:^[a-z]:\\Users\\[^\\]+\\OneDrive( - [^\\]+)?\\' 'Never' 'Files On-Demand' 'Cloud-synced; use Free up space, do not move'
     New-TriageRule 're:^[a-z]:\\Users\\[^\\]+\\Dropbox\\' 'Move' 'Preferences > Sync'    'Move through the Dropbox client, never by hand'
-    New-TriageRule 're:^[a-z]:\\Users\\[^\\]+\\My Drive\\' 'Move' 'Reconnect to D:'      'Google Drive mirrored folder'
+    New-TriageRule 're:^[a-z]:\\Users\\[^\\]+\\My Drive\\' 'Move' 'Reconnect with a folder on the other drive' 'Google Drive mirrored folder'
 
     # === TIER 5: install paths ===============================================
-    New-TriageRule '?:\Program Files\*'               'Never'    'Uninstall and reinstall to D:' 'Install path is registry-bound'
-    New-TriageRule '?:\Program Files (x86)\*'         'Never'    'Uninstall and reinstall to D:' 'Install path is registry-bound'
+    New-TriageRule '?:\Program Files\*'               'Never'    'Uninstall, then reinstall on the other drive' 'Install path is registry-bound'
+    New-TriageRule '?:\Program Files (x86)\*'         'Never'    'Uninstall, then reinstall on the other drive' 'Install path is registry-bound'
+    New-TriageRule '*\AppData\Local\Programs\*'       'Never'    'Uninstall, then reinstall on the other drive' 'Per-user install path'
 
     # === TIER 6: known folders (directly inside a profile) ===================
     New-TriageRule 're:^[a-z]:\\Users\\[^\\]+\\Downloads\\' 'Move' 'Properties > Location tab' 'Downloads'
@@ -267,7 +270,11 @@ $script:TriageRules = @(
     New-TriageRule 're:^[a-z]:\\Users\\[^\\]+\\3D Objects\\' 'Move' 'Properties > Location tab' '3D Objects'
 
     # === TIER 7: generic fallbacks ===========================================
-    New-TriageRule '*\AppData\Local\*Cache*'          'Delete'   'Regenerates'           'Application cache'
+    # Not caches, despite the names. These are final: no file-type fallback.
+    New-TriageRule 're:\\AppData\\Local\\Packages\\[^\\]+\\LocalCache\\' 'Review' 'Confirm owner' 'Packaged-app data, not a cache despite the name'
+    New-TriageRule '*\AppData\Local\Microsoft\TokenBroker\*' 'Review' 'Confirm owner' 'Sign-in tokens'
+    # A directory whose whole name begins or ends with "cache".
+    New-TriageRule 're:\\AppData\\Local\\(?:[^\\]+\\)*?(?:cache[^\\]*|[^\\]*cache)\\' 'Delete' 'Regenerates' 'Application cache'
     New-TriageRule '*\AppData\Local\*\logs\*'         'Delete'   'Regenerates'           'Application logs'
     New-TriageRule '*\AppData\Roaming\*'              'Never'    'Leave in place'        'Application settings, profiles, licences, keys'
 )
@@ -400,6 +407,7 @@ function Get-ScanRoots {
         excluded on purpose: nothing there is safely relocatable, and walking
         them would only produce access-denied noise or tempt elevation.
     #>
+    [CmdletBinding()]
     param([string]$Drive, [string[]]$Extra, [switch]$SkipDefaultRoots)
 
     $prefix = $Drive.ToUpper() + ':\'
@@ -426,22 +434,31 @@ function Get-ScanRoots {
     foreach ($candidate in $Extra) {
         if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
         $full = $null
-        try { $full = [System.IO.Path]::GetFullPath($candidate) } catch { $full = $null }
+        # Absolute paths only: a relative path would resolve against the
+        # process directory, which is not where the user thinks they are.
+        if ($candidate -match '^[A-Za-z]:\\') {
+            try { $full = [System.IO.Path]::GetFullPath($candidate) } catch { $full = $null }
+        }
         if ($null -ne $full -and $full.ToUpper().StartsWith($prefix) -and (Test-Path -LiteralPath $full -PathType Container)) {
             $found.Add($full)
         } else {
-            Write-Warning "Skipping root (not found, or not on drive $($Drive.ToUpper()):): $candidate"
+            Write-Warning "Skipping folder (give a full path to an existing folder on drive $($Drive.ToUpper()):): $candidate"
         }
     }
 
     # Drop duplicates and any root that sits inside another root, so nothing
     # is counted twice.
-    $normalised = @($found | ForEach-Object { $_.TrimEnd('\') } | Sort-Object -Unique)
+    # A drive root keeps its backslash ("C:" alone means "current folder on C:").
+    $normalised = @($found | ForEach-Object {
+        $trimmed = $_.TrimEnd('\')
+        if ($trimmed.Length -eq 2) { $trimmed + '\' } else { $trimmed }
+    } | Sort-Object -Unique)
     $kept = New-Object System.Collections.Generic.List[string]
     foreach ($root in $normalised) {
         $inside = $false
         foreach ($other in $normalised) {
-            if ($other.Length -lt $root.Length -and $root.StartsWith($other + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+            $base = $other.TrimEnd('\') + '\'
+            if ($base.Length -lt $root.Length -and $root.StartsWith($base, [System.StringComparison]::OrdinalIgnoreCase)) {
                 $inside = $true
                 break
             }
@@ -451,13 +468,29 @@ function Get-ScanRoots {
     return $kept.ToArray()
 }
 
+function Test-TriageLink {
+    <#
+        True for junctions and symbolic links (which must never be followed).
+        False for other reparse points, such as OneDrive placeholder folders,
+        which are ordinary local folders. If the type cannot be read, the
+        folder is treated as a link and not followed.
+    #>
+    param([string]$Path)
+    try {
+        $item = Get-Item -LiteralPath $Path -Force
+        $type = [string]$item.LinkType
+        return ($type -eq 'Junction' -or $type -eq 'SymbolicLink')
+    } catch { return $true }
+}
+
 function Add-TriageTally {
     param($State, $Class, [long]$Bytes, [long]$Count)
 
     $State.BucketBytes[$Class.Bucket] += $Bytes
     $State.BucketFiles[$Class.Bucket] += $Count
 
-    $key = $Class.Bucket + '|' + $Class.Mechanism
+    # One row per store: several stores can share the same instruction text.
+    $key = $Class.Bucket + '|' + $Class.Mechanism + '|' + $Class.Note
     if (-not $State.Mechanisms.ContainsKey($key)) {
         $State.Mechanisms[$key] = [pscustomobject]@{
             Bucket = $Class.Bucket; Mechanism = $Class.Mechanism; Note = $Class.Note
@@ -480,6 +513,7 @@ function Invoke-TriageWalk {
     $reparse   = [System.IO.FileAttributes]::ReparsePoint
     $cloudOnly = 0x401000    # Offline (0x1000) + RecallOnDataAccess (0x400000)
     $now       = Get-Date
+    $invariant = [System.Globalization.CultureInfo]::InvariantCulture
     $queue     = New-Object System.Collections.Generic.Queue[object]
     $queue.Enqueue([pscustomobject]@{ Path = $Root; Depth = 0; Subtree = $Root })
 
@@ -488,10 +522,10 @@ function Invoke-TriageWalk {
         $node = $queue.Dequeue()
 
         $dir = $null
-        try { $dir = New-Object System.IO.DirectoryInfo $node.Path } catch { continue }
+        try { $dir = New-Object System.IO.DirectoryInfo $node.Path } catch { $State.DeniedCount++; continue }
         try {
             if (-not $dir.Exists) { continue }
-            if ($dir.Attributes -band $reparse) { continue }
+            if (($dir.Attributes -band $reparse) -and (Test-TriageLink -Path $dir.FullName)) { $State.LinkCount++; continue }
         } catch { $State.DeniedCount++; continue }
 
         $dirKey = $dir.FullName
@@ -505,33 +539,36 @@ function Invoke-TriageWalk {
 
         try {
             foreach ($file in $dir.EnumerateFiles()) {
-                if (([int]$file.Attributes -band $cloudOnly) -ne 0) { $State.CloudOnlyFiles++; continue }
+                # One unreadable or odd file must not cost the rest of the folder.
+                try {
+                    if (([int]$file.Attributes -band $cloudOnly) -ne 0) { $State.CloudOnlyFiles++; continue }
 
-                $length    = $file.Length
-                $dirBytes += $length
+                    $length = $file.Length
 
-                if ($length -ge $MinBytes) {
-                    $class = Get-TriageClassification -Path $file.FullName
-                    Add-TriageTally -State $State -Class $class -Bytes $length -Count 1
-
-                    $idle = [int][math]::Floor(($now - $file.LastWriteTime).TotalDays)
-                    if ($idle -lt 0) { $idle = 0 }
-                    $State.Files.Add([pscustomobject]@{
-                        Bucket    = $class.Bucket
-                        Mechanism = $class.Mechanism
-                        Note      = $class.Note
-                        SizeBytes = [long]$length
-                        LastWrite = $file.LastWriteTime.ToString('yyyy-MM-dd')
-                        DaysIdle  = $idle
-                        Path      = $file.FullName
-                    })
+                    if ($length -ge $MinBytes) {
+                        $class = Get-TriageClassification -Path $file.FullName
+                        $idle  = [int][math]::Floor(($now - $file.LastWriteTime).TotalDays)
+                        if ($idle -lt 0) { $idle = 0 }
+                        $State.Files.Add([pscustomobject]@{
+                            Bucket    = $class.Bucket
+                            Mechanism = $class.Mechanism
+                            Note      = $class.Note
+                            SizeBytes = [long]$length
+                            LastWrite = $file.LastWriteTime.ToString('yyyy-MM-dd', $invariant)
+                            DaysIdle  = $idle
+                            Path      = $file.FullName
+                        })
+                        Add-TriageTally -State $State -Class $class -Bytes $length -Count 1
+                    }
+                    elseif ($dirIsFallback -and $script:TriageExtensionSet.ContainsKey($file.Extension.ToLowerInvariant())) {
+                        $moveBytes += $length; $moveCount++
+                    }
+                    else {
+                        $smallBytes += $length; $smallCount++
+                    }
+                    $dirBytes += $length
                 }
-                elseif ($dirIsFallback -and $script:TriageExtensionSet.ContainsKey($file.Extension.ToLowerInvariant())) {
-                    $moveBytes += $length; $moveCount++
-                }
-                else {
-                    $smallBytes += $length; $smallCount++
-                }
+                catch { $State.DeniedCount++ }
             }
         }
         catch [System.UnauthorizedAccessException]      { $State.DeniedCount++ }
@@ -550,11 +587,9 @@ function Invoke-TriageWalk {
             & $OnProgress $State.DirCount $State.ScannedBytes $dir.FullName
         }
 
-        if ($node.Depth -ge $MaxDepth) { continue }
-
         try {
             foreach ($child in $dir.EnumerateDirectories()) {
-                if ($child.Attributes -band $reparse) { continue }
+                if ($node.Depth -ge $MaxDepth) { $State.DepthLimited++; break }
                 $subtree = $node.Subtree
                 if ($node.Depth -lt 2) { $subtree = $child.FullName }
                 $queue.Enqueue([pscustomobject]@{ Path = $child.FullName; Depth = $node.Depth + 1; Subtree = $subtree })
@@ -578,7 +613,7 @@ function Invoke-TriageScan {
         [ValidatePattern('^[A-Za-z]$')] [string]   $SourceDrive      = 'C',
         [ValidatePattern('^[A-Za-z]$')] [string]   $DestinationDrive = 'D',
         [ValidateRange(1, 1048576)]     [int]      $MinSizeMB        = 100,
-        [ValidateRange(1, 64)]          [int]      $MaxDepth         = 14,
+        [ValidateRange(1, 64)]          [int]      $MaxDepth         = 24,
         [ValidateRange(1, 5000)]        [int]      $TopCount         = 300,
                                         [string[]] $AdditionalRoot   = @(),
                                         [switch]   $SkipDefaultRoots,
@@ -589,6 +624,9 @@ function Invoke-TriageScan {
 
     $source = Get-DriveFacts -Letter $SourceDrive
     if ($null -eq $source) { throw "Drive $($SourceDrive.ToUpper()): is not available." }
+    if ($source.Type -ne 'Fixed') {
+        throw "Drive $($SourceDrive.ToUpper()): is a $($source.Type) drive. Only local fixed disks are scanned, so nothing is ever read over the network."
+    }
     $destination = $null
     if ($DestinationDrive.ToUpper() -ne $SourceDrive.ToUpper()) {
         $destination = Get-DriveFacts -Letter $DestinationDrive
@@ -605,6 +643,8 @@ function Invoke-TriageScan {
         Folders        = @{}
         Files          = New-Object System.Collections.Generic.List[object]
         DeniedCount    = 0
+        LinkCount      = 0
+        DepthLimited   = 0
         CloudOnlyFiles = [long]0
         ScannedBytes   = [long]0
         DirCount       = 0
@@ -640,7 +680,7 @@ function Invoke-TriageScan {
 
     return [pscustomobject]@{
         ToolVersion       = $script:TriageVersion
-        GeneratedAt       = (Get-Date).ToString('yyyy-MM-dd HH:mm')
+        GeneratedAt       = (Get-Date).ToString('yyyy-MM-dd HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
         UserName          = [string]$env:USERNAME
         ComputerName      = [string]$env:COMPUTERNAME
         Source            = $source
@@ -649,6 +689,8 @@ function Invoke-TriageScan {
         MinSizeMB         = $MinSizeMB
         Roots             = @($roots)
         DeniedCount       = [int]$state.DeniedCount
+        LinkFoldersSkipped  = [int]$state.LinkCount
+        DepthLimitedFolders = [int]$state.DepthLimited
         CloudOnlyFiles    = [long]$state.CloudOnlyFiles
         ScannedBytes      = [long]$state.ScannedBytes
         ScannedFiles      = $scannedFiles
@@ -670,23 +712,23 @@ function Get-SampleTriageResult {
     $mechanisms = @(
         [pscustomobject]@{ Bucket = 'Redirect'; Mechanism = 'HF_HOME'; Note = 'Hub, datasets and metrics caches'; Files = [long]1840; TotalBytes = [long](94.2 * $gb) }
         [pscustomobject]@{ Bucket = 'Move'; Mechanism = 'Steam > Storage > Move'; Note = 'Steam game library'; Files = [long]51200; TotalBytes = [long](71.4 * $gb) }
-        [pscustomobject]@{ Bucket = 'Redirect'; Mechanism = 'Settings > Resources > Disk image location'; Note = 'Docker Desktop disk image; prune first'; Files = [long]3; TotalBytes = [long](61.0 * $gb) }
+        [pscustomobject]@{ Bucket = 'Redirect'; Mechanism = 'Settings > Resources > Disk image location'; Note = 'Docker Desktop data: images, containers and volumes. Move it with this setting; do not delete it'; Files = [long]3; TotalBytes = [long](61.0 * $gb) }
         [pscustomobject]@{ Bucket = 'Move'; Mechanism = 'Move + mklink /J'; Note = 'iPhone/iPad backup; no setting exists'; Files = [long]30211; TotalBytes = [long](44.0 * $gb) }
         [pscustomobject]@{ Bucket = 'Move'; Mechanism = 'Properties > Location tab'; Note = 'Downloads'; Files = [long]2210; TotalBytes = [long](38.5 * $gb) }
         [pscustomobject]@{ Bucket = 'Redirect'; Mechanism = 'pkgs_dirs in .condarc'; Note = 'conda package cache'; Files = [long]21450; TotalBytes = [long](22.7 * $gb) }
         [pscustomobject]@{ Bucket = 'Delete'; Mechanism = 'Reinstall from lockfile'; Note = 'Reproducible; never copy'; Files = [long]612044; TotalBytes = [long](14.6 * $gb) }
-        [pscustomobject]@{ Bucket = 'Delete'; Mechanism = 'Recreate on D:'; Note = 'Embeds absolute paths; recreate'; Files = [long]188230; TotalBytes = [long](12.2 * $gb) }
+        [pscustomobject]@{ Bucket = 'Delete'; Mechanism = 'Recreate on the other drive'; Note = 'Virtual environment; save requirements first (pip freeze), never copy'; Files = [long]188230; TotalBytes = [long](12.2 * $gb) }
         [pscustomobject]@{ Bucket = 'Redirect'; Mechanism = 'PIP_CACHE_DIR'; Note = 'pip wheel cache'; Files = [long]6120; TotalBytes = [long](9.8 * $gb) }
         [pscustomobject]@{ Bucket = 'Delete'; Mechanism = 'TEMP / TMP'; Note = 'User temporary files'; Files = [long]9120; TotalBytes = [long](6.3 * $gb) }
     )
 
     $files = @(
-        [pscustomobject]@{ Bucket = 'Redirect'; Mechanism = 'Settings > Resources > Disk image location'; Note = 'Docker Desktop disk image; prune first'; SizeBytes = [long](61.0 * $gb); LastWrite = '2026-11-16'; DaysIdle = 3; Path = "$profilePath\AppData\Local\Docker\wsl\disk\docker_data.vhdx" }
+        [pscustomobject]@{ Bucket = 'Redirect'; Mechanism = 'Settings > Resources > Disk image location'; Note = 'Docker Desktop data: images, containers and volumes. Move it with this setting; do not delete it'; SizeBytes = [long](61.0 * $gb); LastWrite = '2026-11-16'; DaysIdle = 3; Path = "$profilePath\AppData\Local\Docker\wsl\disk\docker_data.vhdx" }
         [pscustomobject]@{ Bucket = 'Redirect'; Mechanism = 'HF_HOME'; Note = 'Hub, datasets and metrics caches'; SizeBytes = [long](15.2 * $gb); LastWrite = '2026-11-07'; DaysIdle = 12; Path = "$profilePath\.cache\huggingface\hub\models--example--model-8b\blobs\2b1879f3" }
         [pscustomobject]@{ Bucket = 'Move'; Mechanism = 'Move + mklink /J'; Note = 'iPhone/iPad backup; no setting exists'; SizeBytes = [long](12.4 * $gb); LastWrite = '2026-10-09'; DaysIdle = 41; Path = "$profilePath\Apple\MobileSync\Backup\00008110-000A1D2E\Manifest.db" }
         [pscustomobject]@{ Bucket = 'Move'; Mechanism = 'Properties > Location tab'; Note = 'Downloads'; SizeBytes = [long](5.8 * $gb); LastWrite = '2026-05-13'; DaysIdle = 190; Path = "$profilePath\Downloads\ubuntu-24.04.1-desktop-amd64.iso" }
         [pscustomobject]@{ Bucket = 'Move'; Mechanism = 'Explorer move'; Note = 'Self-contained data file with no registry dependency'; SizeBytes = [long](4.9 * $gb); LastWrite = '2026-09-16'; DaysIdle = 64; Path = 'C:\Datasets\sample\flows.parquet' }
-        [pscustomobject]@{ Bucket = 'Delete'; Mechanism = 'Recreate on D:'; Note = 'Embeds absolute paths; recreate'; SizeBytes = [long](2.4 * $gb); LastWrite = '2026-10-17'; DaysIdle = 33; Path = 'C:\src\project\.venv\Lib\site-packages\torch\lib\torch_cuda.dll' }
+        [pscustomobject]@{ Bucket = 'Delete'; Mechanism = 'Recreate on the other drive'; Note = 'Virtual environment; save requirements first (pip freeze), never copy'; SizeBytes = [long](2.4 * $gb); LastWrite = '2026-10-17'; DaysIdle = 33; Path = 'C:\src\project\.venv\Lib\site-packages\torch\lib\torch_cuda.dll' }
         [pscustomobject]@{ Bucket = 'Review'; Mechanism = 'Confirm owner'; Note = 'No rule matched'; SizeBytes = [long](2.1 * $gb); LastWrite = '2026-01-23'; DaysIdle = 300; Path = "$profilePath\AppData\Local\SomeVendor\data\store.bin" }
         [pscustomobject]@{ Bucket = 'Never'; Mechanism = 'Uninstall and reinstall to D:'; Note = 'Install path is registry-bound'; SizeBytes = [long](1.9 * $gb); LastWrite = '2026-03-14'; DaysIdle = 250; Path = 'C:\Program Files\Example Toolkit\bin\library64.dll' }
     )
@@ -713,6 +755,8 @@ function Get-SampleTriageResult {
         MinSizeMB         = 100
         Roots             = @($profilePath, 'C:\Users\Public', 'C:\ProgramData', 'C:\src', 'C:\Datasets')
         DeniedCount       = 14
+        LinkFoldersSkipped  = 2
+        DepthLimitedFolders = 0
         CloudOnlyFiles    = [long]0
         ScannedBytes      = $scannedBytes
         ScannedFiles      = $scannedFiles
@@ -748,29 +792,36 @@ function Resolve-ReportDirectory {
     if ([string]::IsNullOrWhiteSpace($Requested)) {
         $target = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'DiskReports'
     } else {
-        $target = [System.IO.Path]::GetFullPath($Requested)
+        $target = $Requested
     }
 
     if ($target.StartsWith('\\')) {
         throw "The report folder must be a local path. Network (UNC) paths are refused: $target"
     }
-
-    $rootPart = [System.IO.Path]::GetPathRoot($target)
-    if ([string]::IsNullOrWhiteSpace($rootPart) -or $rootPart -notmatch '^[A-Za-z]:') {
-        throw "The report folder must be an absolute path on a local drive: $target"
+    if ($target -notmatch '^[A-Za-z]:\\') {
+        throw "The report folder must be a full path on a local drive, for example C:\Reports. Got: $target"
     }
+    $target = [System.IO.Path]::GetFullPath($target)
 
-    $volume = Get-DriveFacts -Letter $rootPart.Substring(0, 1)
+    $volume = Get-DriveFacts -Letter $target.Substring(0, 1)
     if ($null -eq $volume -or $volume.Type -ne 'Fixed') {
         throw "The report folder must be on a local fixed disk: $target"
     }
 
-    if (Test-Path -LiteralPath $target) {
-        $existing = New-Object System.IO.DirectoryInfo $target
-        if ($existing.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
-            throw "The report folder is a junction or symbolic link, which is refused: $target"
+    # Neither the folder nor any folder above it may be a junction or a
+    # symbolic link, so a link cannot send the report somewhere else.
+    $probe = $target
+    while (-not [string]::IsNullOrEmpty($probe) -and $probe.Length -gt 3) {
+        if (Test-Path -LiteralPath $probe) {
+            $info = New-Object System.IO.DirectoryInfo $probe
+            if (($info.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -and (Test-TriageLink -Path $probe)) {
+                throw "The report folder is, or is inside, a junction or symbolic link, which is refused: $probe"
+            }
         }
-    } else {
+        $probe = [System.IO.Path]::GetDirectoryName($probe)
+    }
+
+    if (-not (Test-Path -LiteralPath $target)) {
         New-Item -ItemType Directory -Path $target -Force | Out-Null
     }
 
@@ -816,14 +867,14 @@ function ConvertTo-TriageMarkdown {
     [void]$sb.AppendLine()
     [void]$sb.AppendLine('| Size | Folder |')
     [void]$sb.AppendLine('|---|---|')
-    foreach ($f in @($Result.Folders)) { [void]$sb.AppendLine("| $(Format-Size $f.TotalBytes) | $tick$($f.Folder)$tick |") }
+    foreach ($f in @($Result.Folders)) { [void]$sb.AppendLine("| $(Format-Size $f.TotalBytes) | $tick$(([string]$f.Folder).Replace($tick, "'"))$tick |") }
     [void]$sb.AppendLine()
     [void]$sb.AppendLine("## Largest files ($($Result.MinSizeMB) MB and larger)")
     [void]$sb.AppendLine()
     [void]$sb.AppendLine('| Size | Bucket | What to do | Idle days | Path |')
     [void]$sb.AppendLine('|---|---|---|---|---|')
     foreach ($f in @($Result.Files)) {
-        [void]$sb.AppendLine("| $(Format-Size $f.SizeBytes) | $($f.Bucket) | $($f.Mechanism) | $($f.DaysIdle) | $tick$($f.Path)$tick |")
+        [void]$sb.AppendLine("| $(Format-Size $f.SizeBytes) | $($f.Bucket) | $($f.Mechanism) | $($f.DaysIdle) | $tick$(([string]$f.Path).Replace($tick, "'"))$tick |")
     }
     [void]$sb.AppendLine()
     [void]$sb.AppendLine('## Not measured here - requires administrator')
@@ -834,6 +885,8 @@ function ConvertTo-TriageMarkdown {
     [void]$sb.AppendLine()
     [void]$sb.AppendLine("- Folders scanned: $(@($Result.Roots) -join '; ')")
     [void]$sb.AppendLine("- Unreadable locations skipped: $($Result.DeniedCount) (no privilege escalation attempted)")
+    [void]$sb.AppendLine("- Junctions and symbolic links not followed: $($Result.LinkFoldersSkipped)")
+    [void]$sb.AppendLine("- Folders deeper than the depth limit, not scanned: $($Result.DepthLimitedFolders)")
     [void]$sb.AppendLine("- Cloud-only placeholder files not counted: $($Result.CloudOnlyFiles)")
     [void]$sb.AppendLine("- Total scanned: $(Format-Size $Result.ScannedBytes) in $($Result.ScannedFiles) files")
     return $sb.ToString()
@@ -847,7 +900,7 @@ function Export-TriageReport {
     param([Parameter(Mandatory)] $Result, [string]$Directory)
 
     $target = Resolve-ReportDirectory -Requested $Directory
-    $stamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $stamp  = (Get-Date).ToString('yyyyMMdd-HHmmss', [System.Globalization.CultureInfo]::InvariantCulture)
     $html   = Join-Path $target "DiskTriage_$stamp.html"
     $md     = Join-Path $target "DiskTriage_$stamp.md"
     $csv    = Join-Path $target "DiskTriage_$stamp.csv"
@@ -1349,6 +1402,7 @@ footer code { font-family: var(--mono); font-size: 12.5px; color: var(--ink); ov
   if (!roots.length) { rl.appendChild(el('span', null, 'none')); }
   foot.appendChild(rl);
   foot.appendChild(el('p', null, 'Unreadable locations skipped: ' + fmtInt(R.DeniedCount) + ' (no privilege escalation attempted).'));
+  foot.appendChild(el('p', null, 'Junctions and symbolic links not followed: ' + fmtInt(R.LinkFoldersSkipped || 0) + '. Folders beyond the depth limit, not scanned: ' + fmtInt(R.DepthLimitedFolders || 0) + '.'));
   foot.appendChild(el('p', null, 'Minimum file size listed: ' + fmtInt(R.MinSizeMB) + ' MB.'));
   foot.appendChild(el('p', null, 'Disk space triage tool, version ' + R.ToolVersion + '.'));
   app.appendChild(foot);
@@ -1370,7 +1424,7 @@ $script:TriageXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Disk Space Triage"
-        Width="1180" Height="820" MinWidth="980" MinHeight="640"
+        Width="1180" Height="700" MinWidth="980" MinHeight="560"
         WindowStartupLocation="CenterScreen"
         Background="#F3F5F6"
         FontFamily="Segoe UI" FontSize="13"
@@ -1817,7 +1871,7 @@ function Update-TriageWindow {
     if ($Result.Cancelled) { $rootText = $rootText + ' (partial, scan was cancelled)' }
     $c['RootsText'].Text = $rootText
     $c['RootsText'].ToolTip = ($roots -join "`n")
-    $c['DeniedText'].Text = ('Unreadable locations skipped: {0:N0}' -f [long]$Result.DeniedCount)
+    $c['DeniedText'].Text = ('Skipped: {0:N0} unreadable, {1:N0} links, {2:N0} too deep' -f [long]$Result.DeniedCount, [long]$Result.LinkFoldersSkipped, [long]$Result.DepthLimitedFolders)
 }
 
 function Invoke-TriageGuiScan {
@@ -1899,6 +1953,7 @@ function Invoke-TriageGuiExport {
     try {
         $exported = Export-TriageReport -Result $script:TriageLastResult -Directory $script:TriageGuiReportDir
         $c['ExportPathBox'].Text = [string]$exported.Html
+        $c['ProgressText'].Text = 'Report saved. Open the HTML file shown at the bottom of the window.'
     }
     catch {
         $msg = $_.Exception.Message
@@ -2041,6 +2096,9 @@ function Write-TriageSummary {
         [pscustomobject]@{ Size = Format-Size $_.TotalBytes; Bucket = $_.Bucket; 'What to do' = $_.Mechanism; Why = $_.Note }
     } | Format-Table -AutoSize | Out-Host
 
+    if ($Result.DepthLimitedFolders -gt 0) {
+        Write-Host "$($Result.DepthLimitedFolders) folder(s) were deeper than the depth limit and not scanned. Raise -MaxDepth to include them." -ForegroundColor DarkGray
+    }
     if ($Result.DeniedCount -gt 0) {
         Write-Host "$($Result.DeniedCount) location(s) were unreadable and skipped. Expected; nothing was escalated." -ForegroundColor DarkGray
     }
@@ -2094,7 +2152,7 @@ if ($ShowRules) {
 }
 
 if ((Test-IsElevated) -and -not $AllowElevated) {
-    $message = 'This session is running as administrator. Disk Space Triage needs no administrator rights and refuses to run with them, so a read-only diagnostic can never inherit admin reach. Start it again as your normal user. (Override: -AllowElevated)'
+    $message = 'This session is running as administrator. Disk Space Triage needs no administrator rights and refuses to run with them, so a read-only diagnostic can never inherit admin reach. Start it again as your normal user. If this account is always an administrator, start it with -AllowElevated.'
     if ($Mode -eq 'Gui') {
         Initialize-TriageGui
         [void][System.Windows.MessageBox]::Show($message, 'Disk Space Triage')
@@ -2111,6 +2169,8 @@ if ($Mode -eq 'SelfTest') {
 }
 
 if ($Mode -eq 'Console') {
+    # Check the report folder first, not after minutes of scanning.
+    $reportTarget = Resolve-ReportDirectory -Requested $ReportDirectory
     $progress = {
         param($dirs, $bytes, $path)
         if (($dirs % 500) -eq 0) { Write-Host ("  {0} folders, {1} so far ..." -f $dirs, (Format-Size $bytes)) }
@@ -2118,7 +2178,7 @@ if ($Mode -eq 'Console') {
     $result = Invoke-TriageScan -SourceDrive $SourceDrive -DestinationDrive $DestinationDrive -MinSizeMB $MinSizeMB `
         -MaxDepth $MaxDepth -TopCount $TopCount -AdditionalRoot $AdditionalRoot -SkipDefaultRoots:$SkipDefaultRoots -OnProgress $progress
     Write-TriageSummary -Result $result
-    $report = Export-TriageReport -Result $result -Directory $ReportDirectory
+    $report = Export-TriageReport -Result $result -Directory $reportTarget
     Write-Host ''
     Write-Host 'Reports written:' -ForegroundColor Cyan
     Write-Host "  $($report.Html)"

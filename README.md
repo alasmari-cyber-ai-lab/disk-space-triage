@@ -7,9 +7,10 @@ can leave it safely. Its scan is read-only. Built for machines that do ML and LL
 where model caches, package caches, container disks and virtual environments
 fill `C:` faster than anything a normal cleanup tool looks for.
 
-It never moves or deletes anything. It tells you which **one setting** frees
-the most space. For the common caches it can also apply that setting for you,
-if you allow it and confirm each change.
+It tells you which **one setting** frees the most space. If you allow it, it
+can also act: apply that setting, send rebuildable folders to the Recycle
+Bin, and move large data files to the other drive. Every action is off by
+default and confirmed one item at a time.
 
 ## What it tells you
 
@@ -32,7 +33,7 @@ row is the single change that frees the most space.
 2. Read the script if you want to. It is one plain-text file.
 3. Double-click `Start-DiskSpaceTriage.cmd`. Run it as your normal user, **not** as administrator.
 4. Choose **Scan**, then **Export report**. Reports go to `Documents\DiskReports`.
-5. Optional: on the **Fix with one setting** tab, tick the box, select a row and choose **Apply selected**.
+5. Optional: use one of the three action tabs (see below). On each, tick the box, select a row marked Ready, and press the button.
 
 From a terminal:
 
@@ -62,28 +63,44 @@ To check your download, compare its hash with the one on the release page:
 Get-FileHash .\DiskSpaceTriage.ps1 -Algorithm SHA256
 ```
 
-## The one change it can make
+## What it can change, and only when you say so
 
-The scan is read-only. On the **Fix with one setting** tab the tool can, for a
-fixed list of cache stores (`HF_HOME`, `TORCH_HOME`, `PIP_CACHE_DIR`,
-`npm_config_cache`, `OLLAMA_MODELS` and a few more):
+The scan is read-only. Three tabs can change something. Each has its own
+"Allow" box, acts on one selected item, asks first, and writes what it did to
+`DiskTriage_actions.csv`. Nothing is deleted permanently and nothing is
+overwritten.
 
-1. create an empty folder on the other drive, with the same name and position
-   it has on `C:`, below `D:\FromC`:
-   `C:\Users\you\.cache\huggingface` becomes `D:\FromC\Users\you\.cache\huggingface`;
-2. set the matching **user** environment variable to that folder.
+**Fix with one setting (Redirect).** For twelve cache stores (`HF_HOME`,
+`TORCH_HOME`, `PIP_CACHE_DIR`, `npm_config_cache`, `OLLAMA_MODELS` and others)
+the tool creates an empty folder on the other drive, with the same name and
+position below `D:\FromC`, and sets the matching **user** environment
+variable to it: `C:\Users\you\.cache\huggingface` becomes
+`D:\FromC\Users\you\.cache\huggingface`. It does not move or delete the old
+folder; afterwards it tells you what to do with it (delete a pure cache, move
+Ollama models, copy the Hugging Face sign-in token). It never touches a
+variable you have already set. **Undo last change** works until you close the
+window; after that, remove the variable under Settings > System > About >
+Advanced system settings > Environment Variables.
 
-That is all. It does not move or delete the old folder, it never touches a
-variable you have already set, it needs no administrator rights, it asks
-before every change, it writes each change to `DiskTriage_actions.csv`, and
-**Undo last change** removes the variable again (until you close the window;
-after that, remove it under Settings > System > About > Advanced system
-settings > Environment Variables). After each change it tells you what to do
-with the old folder: delete it for a pure cache, move its contents for stores
-such as Ollama models or the Hugging Face folder, which holds your sign-in
-token. The other drive must be a local NTFS disk, and not the Windows drive. Stores that also hold tools,
-credentials or your own data (Cargo, Gradle, Yarn, TensorFlow Datasets, Docker, WSL, games) are not on
-the list and stay manual.
+**Delete rebuildable folders.** Sends one whole folder to the Recycle Bin.
+Only these are offered: `node_modules` with a lockfile beside it, Rust
+`target\debug` and `target\release` beside a `Cargo.toml`, Steam, GPU and
+DirectX shader caches, crash dumps, and browser, Discord, Slack and classic
+Teams cache folders. A folder is refused if it contains anything that is not
+part of that store, a junction, or anything unreadable. Space is freed when
+you empty the Recycle Bin.
+
+**Move files to the other drive.** For large plain data files (downloads,
+datasets, videos, archives, model weights): the file is copied to
+`D:\FromC\<same path>`, the copy is verified byte for byte with SHA-256, and
+only then is the original sent to the Recycle Bin. A cancelled or failed copy
+is removed and the original is left untouched. Files that belong to a
+program, game, virtual machine, backup or sync folder are never offered.
+
+Everything else stays advice: Docker, WSL, games, virtual machines, the
+Windows known folders, environments, and stores that hold tools or
+credentials (Cargo, Gradle, Yarn, TensorFlow Datasets). The other drive must
+be an internal NTFS disk, and not the Windows drive.
 
 ## Why you can trust it
 
@@ -92,12 +109,15 @@ These are properties of the code, checked on every commit, not promises.
 | Property | How it is enforced |
 | --- | --- |
 | No network access | [`tests/Capability.Tests.ps1`](tests/Capability.Tests.ps1) parses the script and fails the build if any command, .NET type, static call or instance method outside a short allowlist appears. Only local fixed disks are scanned; network drives are refused. CI also runs a real scan with outbound traffic blocked by the firewall. |
-| Never moves or deletes; the scan is read-only | Same allowlist: no move, copy, delete or open call exists in the script. A test compares the names, sizes and timestamps of a scanned tree before and after. |
+| The scan is read-only | A test compares the names, sizes and timestamps of a scanned tree before and after. No scan function contains a call that can open, write or remove a file. |
+| Nothing is deleted permanently | Removal goes through one Recycle Bin call per action, pinned by a test to its function and to the Recycle Bin option. The single permanent delete in the script removes the tool's own unverified partial copy, and is pinned to that variable. |
+| A move cannot lose data | The destination is opened only as a new file (never overwriting); the copy is re-read and compared by SHA-256 before the original is touched. On CI the tests move a real file, cancel a move, and try to overwrite. |
+| Delete touches only rebuildable stores | The folder is re-examined at the moment of deletion: it must be the top of one listed store, with nothing foreign, linked or unreadable in it. Tests attempt to remove a normal folder, the profile, a sub-folder, a mixed store and a store containing a junction. |
 | Changes only what you confirm | The single setter call may appear in exactly two functions, must take its variable name from a list of twelve names pinned by a test, its value from the folder recomputed inside the function, and must target the current user. On CI the tests set a real variable, check the refusals (unknown variable, any other folder, the Windows drive, a non-empty folder, already set) and undo it. |
-| Never reads file contents | Only names, sizes, timestamps and attributes are accessed. |
+| Reads file contents only to move a file | The scan accesses names, sizes, timestamps and attributes only. The one function that opens a file for reading is the copy-and-verify step of Move. |
 | No administrator rights | It refuses to start elevated. CI checks the refusal. |
-| No hidden code | No `Invoke-Expression`, compiled C#, reflection, COM or external processes. One `Add-Type` call loads the WPF assemblies that ship with Windows; the test pins that line exactly. |
-| Writes only its reports and log | Three files per export plus the action log, to a folder on a local fixed disk; and empty folders below `FromC` for confirmed redirects. Network paths, mapped network drives, USB sticks, and any folder that is or sits below a junction or symbolic link are refused. |
+| No hidden code | No `Invoke-Expression`, compiled C#, reflection, COM or external processes. Two `Add-Type` calls load assemblies that ship with Windows (WPF, and the Visual Basic runtime that provides the Recycle Bin); the test pins both lines exactly. |
+| Writes only where it says | Three files per export plus the action log, to a folder on a local fixed disk; redirect folders and moved files only below `FromC`. Network paths, mapped network drives, USB sticks, and any folder that is or sits below a junction or symbolic link are refused. |
 | No persistence | No services, scheduled tasks or start-up entries. The only lasting traces are the reports and any user variable you chose to set. |
 | The report is safe to open | Self-contained HTML with a Content-Security-Policy that blocks every external request; file paths are inserted as text, never as markup. |
 
@@ -120,7 +140,9 @@ later specific one. So the test data is independent of the code:
 - **Redirect does not always mean "then delete the old folder".** Some redirected stores hold your own data (recordings, game worlds, run logs, container volumes). The Why column says which; when in doubt, move.
 - Files below the size threshold are counted in every total but classified by their folder, not individually.
 - System stores that need administrator rights (page file, hibernation file, Windows Update cache) are listed as a checklist, not measured.
-- Classification is advice. Read the "What to do" column before acting, and verify a copy before deleting an original.
+- Classification is advice. Read the "What to do" column before acting.
+- The Recycle Bin has a size limit. For a very large folder or file, Windows may say it is too big to recycle and offer to delete it permanently; the tool lets Windows ask you, and you should answer No unless you are sure.
+- While a file is being moved the window stays responsive enough to cancel, but a large file takes as long as copying it twice.
 
 ## Repository layout
 

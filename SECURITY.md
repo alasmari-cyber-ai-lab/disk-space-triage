@@ -7,7 +7,7 @@ anything worse, and so that this can be checked by reading one file.
 
 | Threat | Control |
 | --- | --- |
-| The tool damages data | It contains no command that moves, copies or deletes files, and it modifies none except its own action log, which it appends to. Enforced by the capability allowlist test. |
+| The tool damages data | The scan cannot change anything. The Delete action sends one folder to the Recycle Bin, and only if, re-examined at that moment, it is the top of a listed rebuildable store with nothing foreign, linked or unreadable inside. The Move action never overwrites, verifies its copy by SHA-256 before the original is touched, and sends the original to the Recycle Bin. The only permanent delete removes the tool's own unverified partial copy. Each of these calls is pinned to one function and one argument by the capability test. |
 | The tool changes settings behind your back | The only setting it can change is a user environment variable from a fixed list of cache locations, and only after you tick the enabling box and confirm that change. It refuses a variable that is already set, any folder other than the one expected folder for that store below `<drive>:\FromC\Users\<you>`, a folder that already has content, the Windows drive, a drive that is not local NTFS, and any path below a junction. Setting a user variable writes one value under `HKCU\Environment`; that is the only registry write the tool makes. System-critical variables (`PATH`, `TEMP`, `APPDATA` ...) are excluded by a test. No change is made unless the log folder is available, and each change is undoable from the window until it is closed. |
 | The tool leaks data | No network commands or types exist in it. Only local fixed disks are scanned, and report folders on network paths are refused. The HTML report loads nothing external. CI runs a scan with outbound traffic blocked. |
 | The tool gains privileges | It needs none and refuses to run elevated. It never requests elevation and performs no token, service or scheduled-task operation, and no registry write other than the user variable described above. |
@@ -16,6 +16,10 @@ anything worse, and so that this can be checked by reading one file.
 | A later change quietly adds a capability | `tests/Capability.Tests.ps1` fails the build for any command, .NET type, static call, URL or write location outside the allowlist. |
 
 ## What it does not protect against
+
+- **A wrong judgement about what is rebuildable.** The Delete list is conservative, but a `node_modules` folder you patched by hand, or a browser cache you wanted, is gone to the Recycle Bin if you confirm. Restore it from there.
+- **The Recycle Bin limit.** If an item is larger than the Recycle Bin allows, Windows offers permanent deletion. The tool shows that Windows prompt rather than suppressing it; the choice is yours.
+- **Moved files and the programs that expect them.** A project that refers to a dataset by its old path must be updated by you.
 
 - **Permissions of redirected folders.** A cache in your profile is private to you. Its replacement below `D:\FromC` inherits the permissions of that drive, which on many PCs let every local user read and change it. On a shared or lab computer, another user could read a Hugging Face token stored there or tamper with cached packages. Use the redirect feature only on a PC you do not share, or tighten the permissions of `D:\FromC\Users\<you>` yourself.
 - **External and substituted drives.** Windows reports USB hard disks and SUBST drives as fixed disks. If a redirected drive is unplugged, the tools that use it fail until it returns or you undo the change.

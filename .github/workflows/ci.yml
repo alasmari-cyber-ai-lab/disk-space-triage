@@ -102,7 +102,7 @@ jobs:
 
       - name: Print the window screenshots (base64) for review from the log
         run: |
-          foreach ($name in 'selftest-window.png', 'selftest-window-fix.png') {
+          foreach ($name in 'selftest-window.png', 'selftest-window-fix.png', 'selftest-window-delete.png', 'selftest-window-move.png') {
             $png = Join-Path $env:RUNNER_TEMP "scan\$name"
             Write-Host "-----BEGIN PNG $name-----"
             [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($png), 'InsertLineBreaks')

@@ -41,6 +41,8 @@ BeforeAll {
         'System.IO.FileAttributes', 'System.IO.Path', 'System.IO.File', 'System.IO.IOException',
         'System.UnauthorizedAccessException', 'System.Security.SecurityException',
         'System.Management.Automation.WildcardOptions', 'System.Text.RegularExpressions.RegexOptions',
+        'System.Security.Cryptography.SHA256', 'System.BitConverter', 'System.IO.FileMode', 'System.IO.FileAccess', 'System.IO.FileShare',
+        'Microsoft.VisualBasic.FileIO.FileSystem', 'Microsoft.VisualBasic.FileIO.UIOption', 'Microsoft.VisualBasic.FileIO.RecycleOption', 'Microsoft.VisualBasic.FileIO.UICancelOption',
         'System.Windows.Clipboard', 'System.Windows.MessageBox', 'System.Windows.MessageBoxButton',
         'System.Windows.MessageBoxImage', 'System.Windows.MessageBoxResult', 'System.Windows.Markup.XamlReader',
         'System.Windows.Media.Imaging.BitmapFrame', 'System.Windows.Media.PixelFormats',
@@ -52,7 +54,7 @@ BeforeAll {
         'System.Collections.Generic.List[object]', 'System.Collections.Generic.List[string]',
         'System.Collections.Generic.Queue[object]',
         'System.Collections.ObjectModel.ObservableCollection[object]',
-        'System.IO.DirectoryInfo', 'System.IO.DriveInfo',
+        'System.IO.DirectoryInfo', 'System.IO.DriveInfo', 'System.IO.FileStream', 'byte[]',
         'System.Management.Automation.WildcardPattern', 'System.Text.RegularExpressions.Regex', 'System.Text.StringBuilder',
         'System.Windows.Size', 'System.Windows.Rect',
         'System.Windows.Media.Imaging.RenderTargetBitmap', 'System.Windows.Media.Imaging.PngBitmapEncoder'
@@ -67,12 +69,16 @@ BeforeAll {
         'FindName', 'FindResource', 'GetEnumerator', 'Invoke', 'IsInRole', 'IsMatch', 'LastIndexOf', 'Measure',
         'Render', 'Replace', 'Save', 'ShowDialog', 'StartsWith', 'Substring', 'ToArray', 'ToLowerInvariant',
         'Add_Checked', 'Add_Unchecked', 'RemoveAt', 'EnumerateFileSystemInfos',
+        'Read', 'Write', 'Flush', 'TransformBlock', 'TransformFinalBlock',
         'ToString', 'ToUpper', 'Trim', 'TrimEnd', 'UpdateLayout'
     )
 
     # Static members allowed on the types that could otherwise read, write or reach out.
     $script:AllowedStaticMembers = @{
-        'System.IO.File'                    = @('Create')
+        'System.IO.File'                    = @('Create', 'OpenRead', 'Delete', 'SetLastWriteTimeUtc')
+        'System.Security.Cryptography.SHA256' = @('Create')
+        'System.BitConverter'               = @('ToString')
+        'Microsoft.VisualBasic.FileIO.FileSystem' = @('DeleteDirectory', 'DeleteFile')
         'System.IO.Path'                    = @('GetFullPath', 'GetDirectoryName', 'GetFileName')
         'scriptblock'                       = @()
         'System.Globalization.CultureInfo'  = @('InvariantCulture')
@@ -117,10 +123,11 @@ Describe 'Commands' {
         @($dynamic) | Should -BeNullOrEmpty
     }
 
-    It 'loads only the WPF assemblies, exactly once, and compiles nothing' {
-        $addType = @($script:Commands | Where-Object { $_.GetCommandName() -eq 'Add-Type' })
-        $addType.Count | Should -Be 1
-        ($addType[0].Extent.Text -replace '\s+', ' ') | Should -Be 'Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase'
+    It 'loads only two assemblies that ship with Windows, and compiles nothing' {
+        $addType = @($script:Commands | Where-Object { $_.GetCommandName() -eq 'Add-Type' } | ForEach-Object { $_.Extent.Text -replace '\s+', ' ' } | Sort-Object)
+        $addType.Count | Should -Be 2
+        $addType[0] | Should -Be 'Add-Type -AssemblyName Microsoft.VisualBasic'
+        $addType[1] | Should -Be 'Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase'
     }
 
     It 'creates only allowlisted .NET objects, and never COM objects' {
@@ -139,7 +146,7 @@ Describe 'Commands' {
 
     It 'writes files only from the report, self-test and action-log functions' {
         $writers = @('Out-File', 'Export-Csv', 'New-Item')
-        $allowedIn = @('Export-TriageReport', 'Resolve-ReportDirectory', 'Invoke-TriageSelfTest', 'Set-TriageRedirect', 'Write-TriageActionLog')
+        $allowedIn = @('Export-TriageReport', 'Resolve-ReportDirectory', 'Invoke-TriageSelfTest', 'Set-TriageRedirect', 'Write-TriageActionLog', 'Move-TriageFile')
         $bad = foreach ($c in ($script:Commands | Where-Object { $writers -contains $_.GetCommandName() })) {
             $where = Get-EnclosingFunction -Node $c
             if ($allowedIn -notcontains $where) { "$($c.GetCommandName()) in $where (line $($c.Extent.StartLineNumber))" }
@@ -248,16 +255,58 @@ Describe '.NET surface' {
 
     It 'creates folders, and only folders, with one pinned command per place' {
         $newItems = @($script:Commands | Where-Object { $_.GetCommandName() -eq 'New-Item' })
-        foreach ($c in $newItems) { ($c.Extent.Text -replace '\s+', ' ') | Should -Match '^New-Item -ItemType Directory -Path \$(value|target) -Force$' }
+        foreach ($c in $newItems) { ($c.Extent.Text -replace '\s+', ' ') | Should -Match '^New-Item -ItemType Directory -Path \$(value|target|folder) -Force$' }
         @($newItems | Where-Object { (Get-EnclosingFunction -Node $_) -eq 'Set-TriageRedirect' }).Count | Should -Be 1
     }
 
-    It 'creates a file stream in exactly one place: the self-test screenshot' {
-        $creates = @($script:Ast.FindAll({ param($n)
-            $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and $n.Static -and
-            $n.Expression.Extent.Text -eq '[System.IO.File]' }, $true))
-        $creates.Count | Should -Be 1
-        Get-EnclosingFunction -Node $creates[0] | Should -Be 'Save-TriageWindowPng'
+    It 'pins every call that can create, delete or change a file to one function and one argument' {
+        $static = @($script:Ast.FindAll({ param($n)
+            $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and $n.Static }, $true))
+
+        function Get-Calls { param($Type, $Member)
+            @($static | Where-Object { $_.Expression.Extent.Text -eq "[$Type]" -and $_.Member.Extent.Text -eq $Member }) }
+
+        # Self-test screenshot
+        $create = Get-Calls 'System.IO.File' 'Create'
+        $create.Count | Should -Be 1
+        Get-EnclosingFunction -Node $create[0] | Should -Be 'Save-TriageWindowPng'
+
+        # Reading file contents happens only while moving a file
+        foreach ($call in (Get-Calls 'System.IO.File' 'OpenRead')) {
+            Get-EnclosingFunction -Node $call | Should -BeIn @('Move-TriageFile', 'Get-TriageFileHash')
+        }
+
+        # The only permanent delete: an unverified partial copy the tool itself just created
+        $delete = Get-Calls 'System.IO.File' 'Delete'
+        $delete.Count | Should -Be 1
+        Get-EnclosingFunction -Node $delete[0] | Should -Be 'Move-TriageFile'
+        $delete[0].Arguments[0].Extent.Text    | Should -Be '$destination'
+
+        $stamp = Get-Calls 'System.IO.File' 'SetLastWriteTimeUtc'
+        $stamp.Count | Should -Be 1
+        $stamp[0].Arguments[0].Extent.Text | Should -Be '$destination'
+
+        # Recycle Bin only, never a permanent delete
+        $recycleDir = Get-Calls 'Microsoft.VisualBasic.FileIO.FileSystem' 'DeleteDirectory'
+        $recycleDir.Count | Should -Be 1
+        Get-EnclosingFunction -Node $recycleDir[0] | Should -Be 'Remove-TriageStore'
+        $recycleFile = Get-Calls 'Microsoft.VisualBasic.FileIO.FileSystem' 'DeleteFile'
+        $recycleFile.Count | Should -Be 1
+        Get-EnclosingFunction -Node $recycleFile[0] | Should -Be 'Move-TriageFile'
+        $recycleFile[0].Arguments[0].Extent.Text    | Should -Be '$source'
+        foreach ($call in @($recycleDir + $recycleFile)) {
+            $call.Arguments.Count          | Should -Be 4
+            $call.Arguments[2].Extent.Text | Should -Be '[Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin'
+        }
+    }
+
+    It 'opens a file for writing in exactly one place, and only as a new file' {
+        $streams = @($script:Commands | Where-Object { $_.GetCommandName() -eq 'New-Object' -and $_.Extent.Text -match 'System\.IO\.FileStream' })
+        $streams.Count | Should -Be 1
+        Get-EnclosingFunction -Node $streams[0] | Should -Be 'Move-TriageFile'
+        $streams[0].Extent.Text | Should -Match '^New-Object System\.IO\.FileStream\(\$destination, \[System\.IO\.FileMode\]::CreateNew, '
+        @($script:Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.MemberExpressionAst] -and $n.Static -and
+            $n.Expression.Extent.Text -eq '[System.IO.FileMode]' }, $true) | ForEach-Object { $_.Member.Extent.Text } | Sort-Object -Unique) | Should -Be @('CreateNew')
     }
 }
 

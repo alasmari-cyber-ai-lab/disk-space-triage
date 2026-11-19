@@ -2,8 +2,8 @@
 <#
 .SYNOPSIS
     Disk Space Triage - shows what is filling a Windows system drive and how
-    each item can leave it safely. The scan is read-only; the tool never moves
-    or deletes anything.
+    each item can leave it safely. The scan is read-only; changes happen only
+    through three optional, confirmed actions.
 
 .DESCRIPTION
     Every finding is sorted into one of five buckets:
@@ -19,27 +19,32 @@
 
       1. LEAST PRIVILEGE. Needs no administrator rights and refuses to run
          elevated unless -AllowElevated is given.
-      2. NEVER MOVES OR DELETES. The scan is read-only. The one change the
-         tool can make, and only after you tick a box and confirm each time,
-         is to set a user environment variable from a fixed list (HF_HOME,
-         PIP_CACHE_DIR ...) and create the empty folder it points to. That
-         change is logged and can be undone.
-      3. METADATA ONLY. File contents are never opened. Only names, sizes,
-         timestamps and attributes are read.
+      2. THE SCAN IS READ-ONLY and reads metadata only: names, sizes,
+         timestamps and attributes. It never opens a file.
+      3. THREE ACTIONS, each off until you tick its box, each confirmed one
+         item at a time, each logged:
+           Redirect - set a user environment variable from a fixed list and
+                      create the empty folder it points to. Undoable.
+           Delete   - send one rebuildable store folder (from a short list)
+                      to the Recycle Bin.
+           Move     - copy one plain data file to <drive>:\FromC\<same path>,
+                      verify the copy by SHA-256, then send the original to
+                      the Recycle Bin. This is the only time a file's contents
+                      are read.
+         Nothing is ever deleted permanently and nothing is overwritten.
       4. NO NETWORK. No download, upload, telemetry or remoting. The HTML
          report is self-contained and carries a Content-Security-Policy that
          blocks every external request.
       5. NO HIDDEN CODE. No Invoke-Expression, no compiled C#, no reflection,
-         no COM, no external processes. The single Add-Type call only loads
-         the WPF assemblies that ship with Windows.
-      6. CONTAINED WRITES. The only files created are the reports and the
-         action log, in one folder on a local fixed disk, plus empty folders
-         below <drive>:\FromC for confirmed redirects. UNC paths, network
-         drives and junctions are refused.
-      7. NO LINK TRAVERSAL. Junctions and symbolic links are never followed.
+         no COM, no external processes. Two Add-Type calls load assemblies
+         that ship with Windows (WPF, and the Visual Basic runtime used to
+         reach the Recycle Bin).
+      6. CONTAINED WRITES. Reports and the action log go to one folder on a
+         local fixed disk. Folders and moved files are created only below
+         <drive>:\FromC. UNC paths, network drives and junctions are refused.
+      7. NO LINK TRAVERSAL. Junctions and symbolic links are never followed,
+         and a folder that contains one is never deleted.
       8. NO PERSISTENCE. No services, scheduled tasks or start-up entries.
-         It runs when you start it. The only lasting traces are the reports
-         and any user variable you chose to set.
 
 .PARAMETER Mode
     Gui (default) opens the window. Console prints a summary and writes the
@@ -302,6 +307,31 @@ $script:TriageMoveExtensions = @(
 )
 
 
+# Delete-bucket stores the tool may send to the Recycle Bin when asked (keyed
+# by the rule's description). Everything else in the Delete bucket stays
+# advice only: temp folders, environments, Office and Windows caches.
+$script:TriageRecyclableNotes = @{
+    'node_modules; needs a package-lock file to rebuild, never copy' = 'NodeModules'
+    'Rust build output, if this is a Cargo project'                  = 'RustTarget'
+    'Steam shader cache'          = 'Cache'
+    'Interrupted Steam downloads' = 'Cache'
+    'GPU shader cache'            = 'Cache'
+    'DirectX shader cache'        = 'Cache'
+    'Crash dumps'                 = 'Cache'
+    'Discord cache'               = 'AppCache'
+    'Slack cache'                 = 'AppCache'
+    'Teams (classic) cache'       = 'AppCache'
+    'Browser cache'               = 'AppCache'
+}
+
+# Move-bucket rules whose files the tool may move itself: plain user files in
+# the known folders. (Files matched only by the file-type fallback are also
+# movable.) Games, virtual machines, backups and sync folders are never moved
+# by the tool.
+$script:TriageMovableNotes = @{
+    'Downloads' = $true; 'Documents' = $true; 'Pictures' = $true; 'Videos' = $true; 'Music' = $true; '3D Objects' = $true
+}
+
 # Stores the tool deliberately does not measure, because doing so needs
 # administrator rights. They are listed in every report as a checklist.
 $script:TriageElevatedChecklist = @(
@@ -385,8 +415,8 @@ function Initialize-TriageRules {
     $script:TriageExtensionSet = @{}
     foreach ($ext in $script:TriageMoveExtensions) { $script:TriageExtensionSet[$ext] = $true }
 
-    $script:TriageFallbackMove   = [pscustomobject]@{ Bucket = 'Move';   Mechanism = 'Explorer move'; Note = 'Self-contained data file with no registry dependency' }
-    $script:TriageFallbackReview = [pscustomobject]@{ Bucket = 'Review'; Mechanism = 'Confirm owner'; Note = 'No rule matched' }
+    $script:TriageFallbackMove   = [pscustomobject]@{ Match = ''; Bucket = 'Move';   Mechanism = 'Explorer move'; Note = 'Self-contained data file with no registry dependency' }
+    $script:TriageFallbackReview = [pscustomobject]@{ Match = ''; Bucket = 'Review'; Mechanism = 'Confirm owner'; Note = 'No rule matched' }
 }
 
 function Get-TriageClassification {
@@ -525,23 +555,59 @@ function Invoke-TriageWalk {
     $now       = Get-Date
     $invariant = [System.Globalization.CultureInfo]::InvariantCulture
     $queue     = New-Object System.Collections.Generic.Queue[object]
-    $queue.Enqueue([pscustomobject]@{ Path = $Root; Depth = 0; Subtree = $Root })
+    $queue.Enqueue([pscustomobject]@{ Path = $Root; Depth = 0; Subtree = $Root; StoreRoot = $null; StoreRule = $null })
 
     while ($queue.Count -gt 0) {
         if ($script:TriageCancel) { $State.Cancelled = $true; return }
         $node = $queue.Dequeue()
 
         $dir = $null
-        try { $dir = New-Object System.IO.DirectoryInfo $node.Path } catch { $State.DeniedCount++; continue }
+        $parentStore = $null
+        if ($null -ne $node.StoreRoot) { $parentStore = $State.Stores[$node.StoreRoot] }
+
+        try { $dir = New-Object System.IO.DirectoryInfo $node.Path } catch {
+            $State.DeniedCount++
+            if ($null -ne $parentStore) { $parentStore.Incomplete = $true }
+            continue
+        }
         try {
             if (-not $dir.Exists) { continue }
-            if (($dir.Attributes -band $reparse) -and (Test-TriageLink -Path $dir.FullName)) { $State.LinkCount++; continue }
-        } catch { $State.DeniedCount++; continue }
+            if (($dir.Attributes -band $reparse) -and (Test-TriageLink -Path $dir.FullName)) {
+                $State.LinkCount++
+                if ($null -ne $parentStore) { $parentStore.HasLink = $true }
+                continue
+            }
+        } catch {
+            $State.DeniedCount++
+            if ($null -ne $parentStore) { $parentStore.Incomplete = $true }
+            continue
+        }
 
         $dirKey = $dir.FullName
         if (-not $dirKey.EndsWith('\')) { $dirKey += '\' }
         $dirClass      = Get-TriageClassification -Path $dirKey
         $dirIsFallback = [object]::ReferenceEquals($dirClass, $script:TriageFallbackReview)
+
+        # Delete candidates: the topmost folder of each recyclable store. A
+        # store is one folder tree in which everything has the same rule.
+        $store = $null
+        if ($dirClass.Bucket -eq 'Delete' -and $script:TriageRecyclableNotes.ContainsKey($dirClass.Note)) {
+            if ($null -ne $parentStore -and [object]::ReferenceEquals($node.StoreRule, $dirClass)) {
+                $store = $parentStore
+            } else {
+                if ($null -ne $parentStore) { $parentStore.Mixed = $true }
+                $store = [pscustomobject]@{
+                    Path = $dir.FullName; Match = $dirClass.Match; Note = $dirClass.Note
+                    TotalBytes = [long]0; Files = [long]0; Mixed = $false; Incomplete = $false; HasLink = $false
+                }
+                $State.Stores[$dir.FullName] = $store
+            }
+        } elseif ($null -ne $parentStore) {
+            $parentStore.Mixed = $true
+        }
+        $deniedBefore = $State.DeniedCount
+        $depthBefore  = $State.DepthLimited
+        $dirFiles     = [long]0
 
         $smallBytes = [long]0; $smallCount = [long]0
         $moveBytes  = [long]0; $moveCount  = [long]0
@@ -569,6 +635,7 @@ function Invoke-TriageWalk {
                             Path      = $file.FullName
                         })
                         Add-TriageTally -State $State -Class $class -Bytes $length -Count 1
+                        if ($null -ne $store -and -not [object]::ReferenceEquals($class, $dirClass)) { $store.Mixed = $true }
                     }
                     elseif ($dirIsFallback -and $script:TriageExtensionSet.ContainsKey($file.Extension.ToLowerInvariant())) {
                         $moveBytes += $length; $moveCount++
@@ -577,6 +644,7 @@ function Invoke-TriageWalk {
                         $smallBytes += $length; $smallCount++
                     }
                     $dirBytes += $length
+                    $dirFiles++
                 }
                 catch { $State.DeniedCount++ }
             }
@@ -602,14 +670,42 @@ function Invoke-TriageWalk {
                 if ($node.Depth -ge $MaxDepth) { $State.DepthLimited++; break }
                 $subtree = $node.Subtree
                 if ($node.Depth -lt 2) { $subtree = $child.FullName }
-                $queue.Enqueue([pscustomobject]@{ Path = $child.FullName; Depth = $node.Depth + 1; Subtree = $subtree })
+                $childRoot = $null; $childRule = $null
+                if ($null -ne $store) { $childRoot = $store.Path; $childRule = $dirClass }
+                $queue.Enqueue([pscustomobject]@{ Path = $child.FullName; Depth = $node.Depth + 1; Subtree = $subtree; StoreRoot = $childRoot; StoreRule = $childRule })
             }
         }
         catch [System.UnauthorizedAccessException]      { $State.DeniedCount++ }
         catch [System.Security.SecurityException]       { $State.DeniedCount++ }
         catch [System.IO.IOException]                   { $State.DeniedCount++ }
         catch                                           { $State.DeniedCount++ }
+
+        if ($null -ne $store) {
+            $store.TotalBytes += $dirBytes
+            $store.Files      += $dirFiles
+            if ($State.DeniedCount -ne $deniedBefore -or $State.DepthLimited -ne $depthBefore) { $store.Incomplete = $true }
+        }
     }
+}
+
+function New-TriageScanState {
+    $state = [pscustomobject]@{
+        BucketBytes    = @{}
+        BucketFiles    = @{}
+        Mechanisms     = @{}
+        Folders        = @{}
+        Stores         = @{}
+        Files          = New-Object System.Collections.Generic.List[object]
+        DeniedCount    = 0
+        LinkCount      = 0
+        DepthLimited   = 0
+        CloudOnlyFiles = [long]0
+        ScannedBytes   = [long]0
+        DirCount       = 0
+        Cancelled      = $false
+    }
+    foreach ($name in @('Redirect', 'Delete', 'Move', 'Review', 'Never')) { $state.BucketBytes[$name] = [long]0; $state.BucketFiles[$name] = [long]0 }
+    return $state
 }
 
 function Invoke-TriageScan {
@@ -646,21 +742,7 @@ function Invoke-TriageScan {
     if ($roots.Count -eq 0) { throw 'There is nothing to scan: no readable folder was found on the source drive.' }
 
     $bucketNames = @('Redirect', 'Delete', 'Move', 'Review', 'Never')
-    $state = [pscustomobject]@{
-        BucketBytes    = @{}
-        BucketFiles    = @{}
-        Mechanisms     = @{}
-        Folders        = @{}
-        Files          = New-Object System.Collections.Generic.List[object]
-        DeniedCount    = 0
-        LinkCount      = 0
-        DepthLimited   = 0
-        CloudOnlyFiles = [long]0
-        ScannedBytes   = [long]0
-        DirCount       = 0
-        Cancelled      = $false
-    }
-    foreach ($name in $bucketNames) { $state.BucketBytes[$name] = [long]0; $state.BucketFiles[$name] = [long]0 }
+    $state = New-TriageScanState
     foreach ($root in $roots)       { $state.Folders[$root] = [long]0 }
 
     $script:TriageCancel = $false
@@ -688,6 +770,9 @@ function Invoke-TriageScan {
 
     $files = @($state.Files | Sort-Object SizeBytes -Descending | Select-Object -First $TopCount)
 
+    $deleteCandidates = @($state.Stores.Values | Where-Object { $_.TotalBytes -gt 0 } |
+        Sort-Object TotalBytes -Descending | Select-Object -First 200)
+
     return [pscustomobject]@{
         ToolVersion       = $script:TriageVersion
         GeneratedAt       = (Get-Date).ToString('yyyy-MM-dd HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
@@ -709,6 +794,7 @@ function Invoke-TriageScan {
         Mechanisms        = $mechanisms
         Folders           = $folders
         Files             = $files
+        DeleteCandidates  = $deleteCandidates
         ElevatedChecklist = @($script:TriageElevatedChecklist)
     }
 }
@@ -781,6 +867,11 @@ function Get-SampleTriageResult {
             [pscustomobject]@{ Folder = "$profilePath\Downloads"; TotalBytes = [long](38.5 * $gb) }
         )
         Files             = $files
+        DeleteCandidates  = @(
+            [pscustomobject]@{ Path = 'C:\src\webapp\node_modules'; Match = '*\node_modules\*'; Note = 'node_modules; needs a package-lock file to rebuild, never copy'; TotalBytes = [long](9.4 * $gb); Files = [long]412044; Mixed = $false; Incomplete = $false; HasLink = $false }
+            [pscustomobject]@{ Path = "$profilePath\AppData\Local\D3DSCache"; Match = '*\AppData\Local\D3DSCache\*'; Note = 'DirectX shader cache'; TotalBytes = [long](2.2 * $gb); Files = [long]6120; Mixed = $false; Incomplete = $false; HasLink = $false }
+            [pscustomobject]@{ Path = "$profilePath\AppData\Local\CrashDumps"; Match = '*\AppData\Local\CrashDumps\*'; Note = 'Crash dumps'; TotalBytes = [long](1.1 * $gb); Files = [long]14; Mixed = $false; Incomplete = $false; HasLink = $false }
+        )
         ElevatedChecklist = @($script:TriageElevatedChecklist)
     }
 }
@@ -1167,6 +1258,336 @@ function Undo-TriageRedirect {
     }
     try { $undo.LogPath = Write-TriageActionLog -Record $undo -Directory $LogDirectory } catch { $undo.LogPath = '' }
     return $undo
+}
+#endregion
+
+#region Delete and Move ------------------------------------------------------
+# Two further actions, each off until the user enables it and confirms:
+#   Delete - send one whole store folder (from a short list of rebuildable
+#            stores) to the Recycle Bin.
+#   Move   - copy one plain data file to <drive>:\FromC\<same path>, verify
+#            the copy byte for byte by SHA-256, then send the original to the
+#            Recycle Bin.
+# Nothing is ever deleted permanently by this script, and nothing is
+# overwritten.
+
+function Initialize-TriageRecycleBin {
+    # The Recycle Bin is reached through the Visual Basic runtime that ships
+    # with Windows. This loads an existing assembly; it compiles nothing.
+    Add-Type -AssemblyName Microsoft.VisualBasic
+}
+
+function Get-TriageDeletePlan {
+    <#
+        Read-only. Lists the store folders the scan found that the tool may
+        send to the Recycle Bin, and why any of them is not offered.
+    #>
+    param([Parameter(Mandatory)] $Result)
+
+    $plan = foreach ($c in @($Result.DeleteCandidates)) {
+        $state = 'Ready'; $reason = ''
+        $kind  = [string]$script:TriageRecyclableNotes[[string]$c.Note]
+        $parent = [System.IO.Path]::GetDirectoryName([string]$c.Path)
+
+        if ($c.Mixed) {
+            $state = 'Blocked'; $reason = 'It contains files that belong to something else.'
+        } elseif ($c.HasLink) {
+            $state = 'Blocked'; $reason = 'It contains a junction or symbolic link.'
+        } elseif ($c.Incomplete) {
+            $state = 'Blocked'; $reason = 'Part of it could not be read, so its contents are not fully known.'
+        } elseif ($kind -eq 'NodeModules') {
+            $lock = $false
+            foreach ($name in @('package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'npm-shrinkwrap.json', 'bun.lockb')) {
+                if (Test-Path -LiteralPath (Join-Path $parent $name) -PathType Leaf) { $lock = $true }
+            }
+            if (-not $lock) { $state = 'Blocked'; $reason = 'No lockfile next to it, so it could not be rebuilt exactly.' }
+        } elseif ($kind -eq 'RustTarget') {
+            $project = [System.IO.Path]::GetDirectoryName($parent)
+            if ([string]::IsNullOrEmpty($project) -or -not (Test-Path -LiteralPath (Join-Path $project 'Cargo.toml') -PathType Leaf)) {
+                $state = 'Blocked'; $reason = 'No Cargo.toml beside the target folder, so this may not be Rust build output.'
+            }
+        } elseif ($kind -eq 'AppCache') {
+            $reason = 'close the application first'
+        }
+
+        [pscustomobject]@{
+            Path      = [string]$c.Path
+            Note      = [string]$c.Note
+            SizeBytes = [long]$c.TotalBytes
+            Files     = [long]$c.Files
+            State     = $state
+            Reason    = $reason
+        }
+    }
+    return @($plan)
+}
+
+function Remove-TriageStore {
+    <#
+        Sends ONE store folder to the Recycle Bin. Everything is re-checked
+        here, so a stale or edited plan item cannot widen what is removed:
+        the folder itself must classify as a recyclable store, its parent must
+        not (it is the top of the store), and it must be a real folder on a
+        local fixed disk with no link above it.
+    #>
+    param([Parameter(Mandatory)] $Item, [string]$LogDirectory, [switch]$ShowDialogs)
+
+    $path = [string]$Item.Path
+    if ($path -notmatch '^[A-Za-z]:\\[^\\]+\\[^\\]+') { throw "Refused: not a folder at least two levels below a drive root: $path" }
+    if ($path.Contains('..') -or $path.EndsWith('\') -or $path.EndsWith('.') -or $path.EndsWith(' ')) { throw "Refused: not a plain folder path: $path" }
+    if ([System.IO.Path]::GetFullPath($path) -cne $path) { throw "Refused: not a normalised path: $path" }
+    if (-not (Test-Path -LiteralPath $path -PathType Container)) { throw "Refused: the folder no longer exists: $path" }
+
+    $volume = Get-DriveFacts -Letter $path.Substring(0, 1)
+    if ($null -eq $volume -or $volume.Type -ne 'Fixed') { throw "Refused: not on a local fixed disk: $path" }
+    if (Test-TriageLinkInPath -Path $path) { throw "Refused: the folder is, or is below, a junction or symbolic link: $path" }
+
+    Initialize-TriageRules
+    $class = Get-TriageClassification -Path ($path + '\')
+    if ($class.Bucket -ne 'Delete' -or -not $script:TriageRecyclableNotes.ContainsKey([string]$class.Note)) {
+        throw "Refused: this folder is not one of the stores the tool may remove: $path"
+    }
+    $parentClass = Get-TriageClassification -Path ([System.IO.Path]::GetDirectoryName($path) + '\')
+    if ([object]::ReferenceEquals($parentClass, $class)) { throw "Refused: this is a folder inside a store, not the store itself: $path" }
+
+    # The same conditions the plan applies, checked against the disk as it is now.
+    $check = @(Get-TriageDeletePlan -Result ([pscustomobject]@{ DeleteCandidates = @(
+        [pscustomobject]@{ Path = $path; Note = $class.Note; TotalBytes = [long]0; Files = [long]0; Mixed = $false; Incomplete = $false; HasLink = $false }) }))
+    if ($check[0].State -ne 'Ready') { throw "Refused: $($check[0].Reason)" }
+
+    # Look at the folder as it is now, not as it was when it was scanned: it
+    # must still be one store with nothing foreign, linked or unreadable in it.
+    $state = New-TriageScanState
+    $script:TriageCancel = $false
+    Invoke-TriageWalk -Root $path -MaxDepth 64 -MinBytes 1MB -State $state -OnProgress $null
+    $now = $state.Stores[$path]
+    if ($null -eq $now) { throw "Refused: the folder could not be examined: $path" }
+    if ($state.Stores.Count -ne 1 -or $now.Mixed) { throw "Refused: the folder contains files that belong to something else: $path" }
+    if ($now.HasLink)    { throw "Refused: the folder contains a junction or symbolic link: $path" }
+    if ($now.Incomplete -or $state.DeniedCount -gt 0 -or $state.DepthLimited -gt 0) { throw "Refused: part of the folder could not be read: $path" }
+
+    $logTarget = Resolve-ReportDirectory -Requested $LogDirectory
+    Initialize-TriageRecycleBin
+
+    $ui = [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs
+    if ($ShowDialogs) { $ui = [Microsoft.VisualBasic.FileIO.UIOption]::AllDialogs }
+    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($path, $ui, [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin, [Microsoft.VisualBasic.FileIO.UICancelOption]::ThrowException)
+
+    $record = [pscustomobject]@{
+        When     = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture)
+        Action   = 'Recycle'
+        Variable = ''
+        OldValue = $path
+        NewValue = 'Recycle Bin'
+        LogPath  = ''
+    }
+    try { $record.LogPath = Write-TriageActionLog -Record $record -Directory $logTarget } catch { $record.LogPath = '' }
+    return $record
+}
+
+function Get-TriageMoveTarget {
+    # C:\Users\me\Downloads\x.iso  ->  D:\FromC\Users\me\Downloads\x.iso
+    param([string]$Source, [string]$Letter)
+    return ('{0}:\FromC\{1}' -f $Letter.ToUpper(), $Source.Substring(3))
+}
+
+function Test-TriageMovableFile {
+    # Returns '' when the tool may move this file, otherwise the reason not.
+    param([string]$Path)
+    Initialize-TriageRules
+    $class = Get-TriageClassification -Path $Path
+    if ([object]::ReferenceEquals($class, $script:TriageFallbackMove)) { return '' }
+    if ($class.Bucket -eq 'Move' -and $script:TriageMovableNotes.ContainsKey([string]$class.Note)) { return '' }
+    return 'This file belongs to a program or store; move it with the owning application.'
+}
+
+function Get-TriageMovePlan {
+    <#
+        Read-only. Lists the large plain data files the scan found that the
+        tool may move, with the place each would go.
+    #>
+    param([Parameter(Mandatory)] $Result, [string]$DestinationDrive)
+
+    $letter = $DestinationDrive
+    if ([string]::IsNullOrWhiteSpace($letter) -and $null -ne $Result.Destination) { $letter = [string]$Result.Destination.Letter }
+    $driveProblem = 'The destination drive is not available.'
+    $free = [long]0
+    if (-not [string]::IsNullOrWhiteSpace($letter)) {
+        $driveProblem = Test-TriageRedirectDrive -Letter $letter
+        $facts = Get-DriveFacts -Letter $letter
+        if ($null -ne $facts) { $free = [long]$facts.FreeBytes }
+    }
+
+    $plan = foreach ($f in @($Result.Files)) {
+        if ($f.Bucket -ne 'Move') { continue }
+        $path = [string]$f.Path
+        if ((Test-TriageMovableFile -Path $path) -ne '') { continue }
+
+        $state = 'Ready'; $reason = ''; $target = ''
+        if ($driveProblem -ne '') {
+            $state = 'Blocked'; $reason = $driveProblem
+        } else {
+            $target = Get-TriageMoveTarget -Source $path -Letter $letter
+            if ($letter.ToUpper() -eq $path.Substring(0, 1).ToUpper()) {
+                $state = 'Blocked'; $reason = 'The destination is the drive the file is already on.'
+            } elseif ($target.Length -gt 240) {
+                $state = 'Blocked'; $reason = 'The new path would be too long for Windows.'
+            } elseif ($free -lt ([long]$f.SizeBytes + 1GB)) {
+                $state = 'Blocked'; $reason = 'Not enough free space on the destination.'
+            } elseif (Test-Path -LiteralPath $target) {
+                $state = 'Blocked'; $reason = 'A file with this name is already there. Check it first.'
+            }
+        }
+
+        [pscustomobject]@{
+            Path      = $path
+            SizeBytes = [long]$f.SizeBytes
+            Target    = $target
+            DaysIdle  = [int]$f.DaysIdle
+            State     = $state
+            Reason    = $reason
+        }
+    }
+    return @($plan)
+}
+
+function Get-TriageFileHash {
+    # SHA-256 of a file, read in blocks so progress can be reported and the
+    # operation cancelled. Returns $null when cancelled.
+    param([string]$Path, [scriptblock]$OnProgress, [string]$Stage)
+
+    $sha    = [System.Security.Cryptography.SHA256]::Create()
+    $buffer = New-Object byte[] 4194304
+    $done   = [long]0
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $total = $stream.Length
+        while ($true) {
+            $read = $stream.Read($buffer, 0, $buffer.Length)
+            if ($read -le 0) { break }
+            [void]$sha.TransformBlock($buffer, 0, $read, $null, 0)
+            $done += $read
+            if ($null -ne $OnProgress) { & $OnProgress $Stage $done $total }
+            if ($script:TriageCancel) { return $null }
+        }
+        [void]$sha.TransformFinalBlock($buffer, 0, 0)
+        return [System.BitConverter]::ToString($sha.Hash)
+    }
+    finally {
+        $stream.Dispose()
+        $sha.Dispose()
+    }
+}
+
+function Move-TriageFile {
+    <#
+        Moves ONE plain data file: copy to <drive>:\FromC\<same path>, verify
+        the copy by SHA-256, keep the original's timestamp, then send the
+        original to the Recycle Bin. Never overwrites. If anything fails or
+        the user cancels before the copy is verified, the partial copy is
+        removed and the original is untouched.
+    #>
+    param([Parameter(Mandatory)] $Item, [string]$LogDirectory, [scriptblock]$OnProgress, [switch]$ShowDialogs)
+
+    $source = [string]$Item.Path
+    if ($source -notmatch '^[A-Za-z]:\\') { throw "Refused: not a full local path: $source" }
+    if ($source.Contains('..') -or [System.IO.Path]::GetFullPath($source) -cne $source) { throw "Refused: not a normalised path: $source" }
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Refused: the file no longer exists: $source" }
+
+    $problem = Test-TriageMovableFile -Path $source
+    if ($problem -ne '') { throw "Refused: $problem" }
+
+    $shown = [string]$Item.Target
+    if ($shown -notmatch '^[A-Za-z]:\\FromC\\') { throw "Refused: the new place must be below <drive>:\FromC. Got: $shown" }
+    $letter      = $shown.Substring(0, 1)
+    $destination = Get-TriageMoveTarget -Source $source -Letter $letter
+    if ($shown -cne $destination) { throw "Refused: the new place must be exactly $destination. Got: $shown" }
+    if ($letter.ToUpper() -eq $source.Substring(0, 1).ToUpper()) { throw 'Refused: the destination is the drive the file is already on.' }
+
+    $driveProblem = Test-TriageRedirectDrive -Letter $letter
+    if ($driveProblem -ne '') { throw "Refused: $driveProblem" }
+
+    $info = Get-Item -LiteralPath $source -Force
+    if (([int]$info.Attributes -band 0x401400) -ne 0) { throw 'Refused: the file is a link or a cloud-only placeholder.' }
+    if (Test-TriageLinkInPath -Path ([System.IO.Path]::GetDirectoryName($source))) { throw 'Refused: the file is below a junction or symbolic link.' }
+    $size = [long]$info.Length
+
+    $facts = Get-DriveFacts -Letter $letter
+    if ($facts.FreeBytes -lt ($size + 1GB)) { throw 'Refused: not enough free space on the destination.' }
+    if (Test-Path -LiteralPath $destination) { throw "Refused: something already exists at $destination. Nothing is ever overwritten." }
+
+    $folder = [System.IO.Path]::GetDirectoryName($destination)
+    if (Test-TriageLinkInPath -Path $folder) { throw "Refused: the new place is below a junction or symbolic link: $folder" }
+
+    $logTarget = Resolve-ReportDirectory -Requested $LogDirectory
+    Initialize-TriageRecycleBin
+    if (-not (Test-Path -LiteralPath $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
+
+    $script:TriageCancel = $false
+    $created  = $false
+    $verified = $false
+    try {
+        # 1. Copy, hashing the source as it is read.
+        $sha    = [System.Security.Cryptography.SHA256]::Create()
+        $buffer = New-Object byte[] 4194304
+        $done   = [long]0
+        $in     = [System.IO.File]::OpenRead($source)
+        try {
+            $out = New-Object System.IO.FileStream($destination, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            $created = $true
+            try {
+                while ($true) {
+                    $read = $in.Read($buffer, 0, $buffer.Length)
+                    if ($read -le 0) { break }
+                    $out.Write($buffer, 0, $read)
+                    [void]$sha.TransformBlock($buffer, 0, $read, $null, 0)
+                    $done += $read
+                    if ($null -ne $OnProgress) { & $OnProgress 'Copying' $done $size }
+                    if ($script:TriageCancel) { throw 'Cancelled. The original file was not touched.' }
+                }
+                $out.Flush($true)
+            }
+            finally { $out.Dispose() }
+        }
+        finally { $in.Dispose() }
+        [void]$sha.TransformFinalBlock($buffer, 0, 0)
+        $sourceHash = [System.BitConverter]::ToString($sha.Hash)
+        $sha.Dispose()
+
+        # 2. Verify by reading the copy back from the destination disk.
+        if ($done -ne $size) { throw 'The file changed while it was being copied. The original was not touched.' }
+        $copyHash = Get-TriageFileHash -Path $destination -OnProgress $OnProgress -Stage 'Verifying'
+        if ($null -eq $copyHash) { throw 'Cancelled. The original file was not touched.' }
+        if ($copyHash -cne $sourceHash) { throw 'The copy does not match the original. The original was not touched.' }
+        [System.IO.File]::SetLastWriteTimeUtc($destination, $info.LastWriteTimeUtc)
+        $verified = $true
+    }
+    finally {
+        # An unverified copy is never left behind.
+        if ($created -and -not $verified) { [System.IO.File]::Delete($destination) }
+    }
+
+    # 3. Only now does the original go to the Recycle Bin.
+    $recycled = $true
+    $ui = [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs
+    if ($ShowDialogs) { $ui = [Microsoft.VisualBasic.FileIO.UIOption]::AllDialogs }
+    try {
+        [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($source, $ui, [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin, [Microsoft.VisualBasic.FileIO.UICancelOption]::ThrowException)
+    } catch { $recycled = $false }
+
+    $record = [pscustomobject]@{
+        When     = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture)
+        Action   = 'Move'
+        Variable = ''
+        OldValue = $source
+        NewValue = $destination
+        LogPath  = ''
+        OriginalRecycled = $recycled
+        Sha256   = $sourceHash.Replace('-', '')
+    }
+    if (-not $recycled) { $record.Action = 'Copy (original kept)' }
+    try { $record.LogPath = Write-TriageActionLog -Record $record -Directory $logTarget } catch { $record.LogPath = '' }
+    return $record
 }
 #endregion
 
@@ -1921,7 +2342,7 @@ $script:TriageXaml = @'
         <StackPanel Grid.Column="0" VerticalAlignment="Center" Margin="0,0,16,0">
           <TextBlock Text="Disk Space Triage" FontSize="24" FontWeight="SemiBold" Foreground="#FFFFFF"/>
           <TextBlock Text="Find. Understand. Fix." FontSize="14" Margin="0,1,0,0" Foreground="#A9DCE6"/>
-          <TextBlock Text="Scanning only reads folder sizes. Nothing changes unless you allow it in the Fix tab." FontSize="11.5" Margin="0,3,0,0" TextWrapping="Wrap" Foreground="#C9D9DF"/>
+          <TextBlock Text="Scanning only reads folder sizes. Nothing changes unless you allow it on one of the action tabs." FontSize="11.5" Margin="0,3,0,0" TextWrapping="Wrap" Foreground="#C9D9DF"/>
         </StackPanel>
         <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
           <Border Width="290" Margin="0,0,12,0" Padding="12,8,12,9" Background="{StaticResource SurfaceBrush}" CornerRadius="6">
@@ -2095,6 +2516,76 @@ $script:TriageXaml = @'
         </Grid>
       </TabItem>
 
+      <TabItem Header="Delete rebuildable folders">
+        <Grid>
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+          </Grid.RowDefinitions>
+          <Border Grid.Row="0" Margin="12,12,12,10" Padding="14,8,14,8" Background="#FFF3D1" BorderBrush="#C8962B" BorderThickness="4,1,1,1" CornerRadius="6">
+            <StackPanel>
+              <TextBlock TextWrapping="Wrap" FontSize="12.5" Foreground="{StaticResource InkBrush}" Text="These folders can be rebuilt or refill by themselves: package folders with a lockfile, shader and browser caches, crash dumps. The tool sends the whole folder to the Recycle Bin, so you can restore it. Space on the drive is freed when you empty the Recycle Bin. Close the application that owns a cache first."/>
+              <CheckBox x:Name="EnableDeleteBox" Content="Allow this tool to send folders to the Recycle Bin" IsChecked="False" Margin="0,8,0,0" FontWeight="SemiBold" Foreground="{StaticResource InkBrush}"/>
+            </StackPanel>
+          </Border>
+          <DataGrid x:Name="DeleteGrid" Grid.Row="1" Style="{StaticResource GridStyle}" AutoGenerateColumns="False" IsReadOnly="True" CanUserAddRows="False" HeadersVisibility="Column" GridLinesVisibility="Horizontal" SelectionMode="Single">
+            <DataGrid.Columns>
+              <DataGridTextColumn Header="Size" Binding="{Binding SizeText, Mode=OneWay}" SortMemberPath="SizeBytes" Width="100" ElementStyle="{StaticResource CellRight}" HeaderStyle="{StaticResource HeaderRight}"/>
+              <DataGridTextColumn Header="What it is" Binding="{Binding Note, Mode=OneWay}" Width="220" ElementStyle="{StaticResource CellWrap}"/>
+              <DataGridTextColumn Header="Folder" Binding="{Binding Path, Mode=OneWay}" Width="*" MinWidth="300" ElementStyle="{StaticResource CellWrap}"/>
+              <DataGridTextColumn Header="Status" Binding="{Binding StatusText, Mode=OneWay}" Width="230" ElementStyle="{StaticResource CellWrap}"/>
+            </DataGrid.Columns>
+          </DataGrid>
+          <Grid Grid.Row="2" Margin="12,10,12,10">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="Auto"/>
+              <ColumnDefinition Width="*" MinWidth="300"/>
+            </Grid.ColumnDefinitions>
+            <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Top">
+              <Button x:Name="DeleteStoreButton" Content="Send selected to Recycle Bin..." IsEnabled="False" Style="{StaticResource PrimaryButton}" Margin="0,0,16,0"/>
+            </StackPanel>
+            <TextBlock x:Name="DeleteMessage" Grid.Column="1" TextWrapping="Wrap" VerticalAlignment="Center" FontSize="12.5" Foreground="{StaticResource InkBrush}"/>
+          </Grid>
+        </Grid>
+      </TabItem>
+
+      <TabItem Header="Move files to the other drive">
+        <Grid>
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+          </Grid.RowDefinitions>
+          <Border Grid.Row="0" Margin="12,12,12,10" Padding="14,8,14,8" Background="#FFF3D1" BorderBrush="#C8962B" BorderThickness="4,1,1,1" CornerRadius="6">
+            <StackPanel>
+              <TextBlock TextWrapping="Wrap" FontSize="12.5" Foreground="{StaticResource InkBrush}" Text="Large data files (downloads, datasets, videos, archives, model weights). The tool copies the file to the other drive under FromC with the same folder names, checks the copy byte for byte, and only then sends the original to the Recycle Bin. Nothing is overwritten. Files that belong to a program, game, virtual machine or sync folder are not listed: move those with the owning application."/>
+              <CheckBox x:Name="EnableMoveBox" Content="Allow this tool to move files" IsChecked="False" Margin="0,8,0,0" FontWeight="SemiBold" Foreground="{StaticResource InkBrush}"/>
+            </StackPanel>
+          </Border>
+          <DataGrid x:Name="MoveGrid" Grid.Row="1" Style="{StaticResource GridStyle}" AutoGenerateColumns="False" IsReadOnly="True" CanUserAddRows="False" HeadersVisibility="Column" GridLinesVisibility="Horizontal" SelectionMode="Single">
+            <DataGrid.Columns>
+              <DataGridTextColumn Header="Size" Binding="{Binding SizeText, Mode=OneWay}" SortMemberPath="SizeBytes" Width="100" ElementStyle="{StaticResource CellRight}" HeaderStyle="{StaticResource HeaderRight}"/>
+              <DataGridTextColumn Header="Idle days" Binding="{Binding DaysIdle, Mode=OneWay}" Width="80" ElementStyle="{StaticResource CellRight}" HeaderStyle="{StaticResource HeaderRight}"/>
+              <DataGridTextColumn Header="File" Binding="{Binding Path, Mode=OneWay}" Width="*" MinWidth="230" ElementStyle="{StaticResource CellWrap}"/>
+              <DataGridTextColumn Header="New place" Binding="{Binding Target, Mode=OneWay}" Width="*" MinWidth="230" ElementStyle="{StaticResource CellWrap}"/>
+              <DataGridTextColumn Header="Status" Binding="{Binding StatusText, Mode=OneWay}" Width="200" ElementStyle="{StaticResource CellWrap}"/>
+            </DataGrid.Columns>
+          </DataGrid>
+          <Grid Grid.Row="2" Margin="12,10,12,10">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="Auto"/>
+              <ColumnDefinition Width="*" MinWidth="300"/>
+            </Grid.ColumnDefinitions>
+            <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Top">
+              <Button x:Name="MoveFileButton" Content="Move selected file..." IsEnabled="False" Style="{StaticResource PrimaryButton}"/>
+              <Button x:Name="MoveCancelButton" Content="Cancel move" IsEnabled="False" Style="{StaticResource PlainButton}" Margin="0,0,16,0"/>
+            </StackPanel>
+            <TextBlock x:Name="MoveMessage" Grid.Column="1" TextWrapping="Wrap" VerticalAlignment="Center" FontSize="12.5" Foreground="{StaticResource InkBrush}"/>
+          </Grid>
+        </Grid>
+      </TabItem>
+
       <TabItem Header="Largest files">
         <Grid>
           <Grid.RowDefinitions>
@@ -2186,7 +2677,9 @@ function Get-TriageControlNames {
         'RedirectSize', 'RedirectFiles', 'DeleteSize', 'DeleteFiles', 'MoveSize', 'MoveFiles',
         'MainTabs', 'MechanismsGrid', 'BucketFilter', 'FilesCountText', 'FilesGrid', 'FoldersGrid', 'ElevatedGrid',
         'RootsText', 'DeniedText', 'ExportPathBox', 'CopyPathButton',
-        'ExtraRootsBox', 'EnableActionsBox', 'RedirectGrid', 'ApplyRedirectButton', 'UndoRedirectButton', 'RedirectMessage'
+        'ExtraRootsBox', 'EnableActionsBox', 'RedirectGrid', 'ApplyRedirectButton', 'UndoRedirectButton', 'RedirectMessage',
+        'EnableDeleteBox', 'DeleteGrid', 'DeleteStoreButton', 'DeleteMessage',
+        'EnableMoveBox', 'MoveGrid', 'MoveFileButton', 'MoveCancelButton', 'MoveMessage'
     )
 }
 
@@ -2284,7 +2777,7 @@ function Set-TriageFilesGrid {
 function Update-TriageRedirectButtons {
     param([Parameter(Mandatory = $true)][hashtable]$Ui)
     $c = $Ui.Controls
-    $on = ($c['EnableActionsBox'].IsChecked -eq $true) -and (-not $script:TriageScanning)
+    $on = ($c['EnableActionsBox'].IsChecked -eq $true) -and (-not $script:TriageScanning) -and (-not $script:TriageBusy)
     $canApply = $false
     $selected = $c['RedirectGrid'].SelectedItem
     if ($on -and $null -ne $selected) {
@@ -2354,6 +2847,148 @@ function Update-TriageRedirectGrid {
     Update-TriageRedirectButtons -Ui $Ui
 }
 
+function Update-TriageDeleteButtons {
+    param([Parameter(Mandatory = $true)][hashtable]$Ui)
+    $c = $Ui.Controls
+    $on = ($c['EnableDeleteBox'].IsChecked -eq $true) -and (-not $script:TriageScanning) -and (-not $script:TriageBusy)
+    $canDelete = $false
+    $selected = $c['DeleteGrid'].SelectedItem
+    if ($on -and $null -ne $selected) {
+        if ([string]$selected.State -eq 'Ready') { $canDelete = $true }
+    }
+    $c['DeleteStoreButton'].IsEnabled = $canDelete
+}
+
+function Set-TriageDeleteRows {
+    param([Parameter(Mandatory = $true)][hashtable]$Ui)
+    $rows = New-Object 'System.Collections.ObjectModel.ObservableCollection[object]'
+    foreach ($p in @($script:TriageDeletePlan)) {
+        $state = [string]$p.State
+        $reason = [string]$p.Reason
+        $status = $state
+        if ($state -eq 'Ready') {
+            $status = 'Ready'
+            if ($reason.Length -gt 0) { $status = 'Ready (' + $reason + ')' }
+        }
+        elseif ($state -eq 'Blocked') {
+            $status = 'Not possible: ' + $reason
+        }
+        $rows.Add([pscustomobject]@{
+            Path       = [string]$p.Path
+            Note       = [string]$p.Note
+            SizeText   = (Format-Size -Bytes ([double]$p.SizeBytes))
+            SizeBytes  = [long]$p.SizeBytes
+            State      = $state
+            Reason     = $reason
+            StatusText = $status
+        })
+    }
+    $Ui.Controls['DeleteGrid'].ItemsSource = $rows
+}
+
+function Update-TriageDeleteGrid {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Ui,
+        [Parameter(Mandatory = $true)]$Result
+    )
+    $c = $Ui.Controls
+    $plan = @()
+    $problem = ''
+    try {
+        $plan = @(Get-TriageDeletePlan -Result $Result)
+    }
+    catch {
+        $plan = @()
+        $problem = $_.Exception.Message
+    }
+    $script:TriageDeletePlan = $plan
+    Set-TriageDeleteRows -Ui $Ui
+    if ($plan.Count -eq 0) {
+        if ($problem.Length -gt 0) {
+            $c['DeleteMessage'].Text = ('Could not work out which folders can be removed: ' + $problem)
+        }
+        else {
+            $c['DeleteMessage'].Text = 'The scan found no folder the tool can remove safely.'
+        }
+    }
+    Update-TriageDeleteButtons -Ui $Ui
+}
+
+function Update-TriageMoveButtons {
+    param([Parameter(Mandatory = $true)][hashtable]$Ui)
+    $c = $Ui.Controls
+    $on = ($c['EnableMoveBox'].IsChecked -eq $true) -and (-not $script:TriageScanning) -and (-not $script:TriageBusy)
+    $canMove = $false
+    $selected = $c['MoveGrid'].SelectedItem
+    if ($on -and $null -ne $selected) {
+        if ([string]$selected.State -eq 'Ready') { $canMove = $true }
+    }
+    $c['MoveFileButton'].IsEnabled = $canMove
+}
+
+function Set-TriageMoveRows {
+    param([Parameter(Mandatory = $true)][hashtable]$Ui)
+    $rows = New-Object 'System.Collections.ObjectModel.ObservableCollection[object]'
+    foreach ($p in @($script:TriageMovePlan)) {
+        $state = [string]$p.State
+        $reason = [string]$p.Reason
+        $status = $state
+        if ($state -eq 'Ready') {
+            $status = 'Ready'
+            if ($reason.Length -gt 0) { $status = 'Ready (' + $reason + ')' }
+        }
+        elseif ($state -eq 'Blocked') {
+            $status = 'Not possible: ' + $reason
+        }
+        $rows.Add([pscustomobject]@{
+            Path       = [string]$p.Path
+            Target     = [string]$p.Target
+            SizeText   = (Format-Size -Bytes ([double]$p.SizeBytes))
+            SizeBytes  = [long]$p.SizeBytes
+            DaysIdle   = [int]$p.DaysIdle
+            State      = $state
+            Reason     = $reason
+            StatusText = $status
+        })
+    }
+    $Ui.Controls['MoveGrid'].ItemsSource = $rows
+}
+
+function Update-TriageMoveGrid {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Ui,
+        [Parameter(Mandatory = $true)]$Result
+    )
+    $c = $Ui.Controls
+    $plan = @()
+    $problem = ''
+    try {
+        $plan = @(Get-TriageMovePlan -Result $Result)
+    }
+    catch {
+        $plan = @()
+        $problem = $_.Exception.Message
+    }
+    $script:TriageMovePlan = $plan
+    Set-TriageMoveRows -Ui $Ui
+    if ($plan.Count -eq 0) {
+        if ($problem.Length -gt 0) {
+            $c['MoveMessage'].Text = ('Could not work out which files can be moved: ' + $problem)
+        }
+        else {
+            $c['MoveMessage'].Text = 'The scan found no file the tool can move.'
+        }
+    }
+    Update-TriageMoveButtons -Ui $Ui
+}
+
+function Update-TriageAllActionButtons {
+    param([Parameter(Mandatory = $true)][hashtable]$Ui)
+    Update-TriageRedirectButtons -Ui $Ui
+    Update-TriageDeleteButtons -Ui $Ui
+    Update-TriageMoveButtons -Ui $Ui
+}
+
 function Update-TriageWindow {
     param(
         [Parameter(Mandatory = $true)][hashtable]$Ui,
@@ -2392,6 +3027,12 @@ function Update-TriageWindow {
     # Fix with one setting
     $c['RedirectMessage'].Text = ''
     Update-TriageRedirectGrid -Ui $Ui -Result $Result
+
+    # Delete rebuildable folders and Move files
+    $c['DeleteMessage'].Text = ''
+    Update-TriageDeleteGrid -Ui $Ui -Result $Result
+    $c['MoveMessage'].Text = ''
+    Update-TriageMoveGrid -Ui $Ui -Result $Result
 
     # Files (honours the current bucket filter)
     Set-TriageFilesGrid -Ui $Ui -Result $Result -Bucket (Get-TriageSelectedBucket -Ui $Ui)
@@ -2433,6 +3074,11 @@ function Invoke-TriageGuiScan {
     $src = ([string]$c['SourceBox'].Text).Trim()
     $dst = ([string]$c['DestBox'].Text).Trim()
     $minText = ([string]$c['MinSizeBox'].Text).Trim()
+
+    if ($script:TriageBusy) {
+        $c['ProgressText'].Text = 'Wait until the file move has finished.'
+        return
+    }
 
     if ($src -notmatch '^[A-Za-z]$') {
         [void][System.Windows.MessageBox]::Show('Source drive must be a single letter, for example C.', $caption, [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
@@ -2478,6 +3124,8 @@ function Invoke-TriageGuiScan {
     $c['ExportButton'].IsEnabled = $false
     $c['ApplyRedirectButton'].IsEnabled = $false
     $c['UndoRedirectButton'].IsEnabled = $false
+    $c['DeleteStoreButton'].IsEnabled = $false
+    $c['MoveFileButton'].IsEnabled = $false
     $script:TriageScanning = $true
     $c['ProgressText'].Text = 'Starting scan...'
 
@@ -2515,7 +3163,7 @@ function Invoke-TriageGuiScan {
         $c['ScanButton'].IsEnabled = $true
         $c['CancelButton'].IsEnabled = $false
         if ($null -ne $script:TriageLastResult) { $c['ExportButton'].IsEnabled = $true }
-        Update-TriageRedirectButtons -Ui $ui
+        Update-TriageAllActionButtons -Ui $ui
     }
 }
 
@@ -2674,6 +3322,190 @@ function Invoke-TriageGuiUndoRedirect {
     Update-TriageRedirectButtons -Ui $ui
 }
 
+function Invoke-TriageGuiDeleteStore {
+    $ui = $script:TriageUi
+    $c = $ui.Controls
+    $caption = 'Disk Space Triage'
+    if ($script:TriageScanning -or $script:TriageBusy) {
+        $c['DeleteMessage'].Text = 'Not removed: wait until the current scan or move has finished.'
+        return
+    }
+    if ($c['EnableDeleteBox'].IsChecked -ne $true) {
+        $c['DeleteMessage'].Text = 'Not removed: tick "Allow this tool to send folders to the Recycle Bin" first.'
+        return
+    }
+    $selected = $c['DeleteGrid'].SelectedItem
+    if ($null -eq $selected) {
+        $c['DeleteMessage'].Text = 'Not removed: select a row first.'
+        return
+    }
+    $planItem = $null
+    foreach ($p in @($script:TriageDeletePlan)) {
+        if ([string]$p.Path -ceq [string]$selected.Path) { $planItem = $p }
+    }
+    if ($null -eq $planItem) {
+        $c['DeleteMessage'].Text = 'Not removed: that row is no longer in the plan. Scan again.'
+        return
+    }
+    if ([string]$planItem.State -ne 'Ready') {
+        $c['DeleteMessage'].Text = 'Not removed: this folder cannot be removed right now. See the Status column.'
+        return
+    }
+
+    $lines = @(
+        ('Folder: ' + [string]$planItem.Path),
+        ('Size: ' + (Format-Size -Bytes ([double]$planItem.SizeBytes))),
+        ('What it is: ' + [string]$planItem.Note),
+        '',
+        'The whole folder goes to the Recycle Bin. You can restore it from there. If Windows says it is too big for the Recycle Bin and offers to delete it permanently, answer No unless you are sure.',
+        '',
+        'Send this folder to the Recycle Bin?'
+    )
+    $text = ($lines -join "`n")
+    $answer = [System.Windows.MessageBox]::Show($text, $caption, [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question, [System.Windows.MessageBoxResult]::No)
+    if ($answer -ne [System.Windows.MessageBoxResult]::Yes) {
+        $c['DeleteMessage'].Text = 'Not removed: you chose No.'
+        return
+    }
+    $record = $null
+    $failure = ''
+    $failed = $false
+    try {
+        $record = Remove-TriageStore -Item $planItem -LogDirectory $script:TriageGuiReportDir -ShowDialogs
+    }
+    catch {
+        $failed = $true
+        $failure = $_.Exception.Message
+    }
+    if ($failed) {
+        $c['DeleteMessage'].Text = ('Not removed: ' + $failure)
+        return
+    }
+
+    $remaining = @()
+    foreach ($p in @($script:TriageDeletePlan)) {
+        if ([string]$p.Path -cne [string]$planItem.Path) { $remaining += $p }
+    }
+    $script:TriageDeletePlan = $remaining
+    Set-TriageDeleteRows -Ui $ui
+
+    $message = ('Sent to the Recycle Bin: {0}. Empty the Recycle Bin to free the space.' -f [string]$planItem.Path)
+    if (([string]$record.LogPath).Length -gt 0) {
+        $message = $message + ' Change log: ' + [string]$record.LogPath
+    } else {
+        $message = $message + ' Note: this change could NOT be written to the change log (is the file open in another program?).'
+    }
+    $c['DeleteMessage'].Text = $message
+    Update-TriageDeleteButtons -Ui $ui
+}
+
+function Invoke-TriageGuiMoveFile {
+    $ui = $script:TriageUi
+    $c = $ui.Controls
+    $caption = 'Disk Space Triage'
+    if ($script:TriageScanning -or $script:TriageBusy) {
+        $c['MoveMessage'].Text = 'Not moved: wait until the current scan or move has finished.'
+        return
+    }
+    if ($c['EnableMoveBox'].IsChecked -ne $true) {
+        $c['MoveMessage'].Text = 'Not moved: tick "Allow this tool to move files" first.'
+        return
+    }
+    $selected = $c['MoveGrid'].SelectedItem
+    if ($null -eq $selected) {
+        $c['MoveMessage'].Text = 'Not moved: select a row first.'
+        return
+    }
+    $planItem = $null
+    foreach ($p in @($script:TriageMovePlan)) {
+        if ([string]$p.Path -ceq [string]$selected.Path) { $planItem = $p }
+    }
+    if ($null -eq $planItem) {
+        $c['MoveMessage'].Text = 'Not moved: that row is no longer in the plan. Scan again.'
+        return
+    }
+    if ([string]$planItem.State -ne 'Ready') {
+        $c['MoveMessage'].Text = 'Not moved: this file cannot be moved right now. See the Status column.'
+        return
+    }
+
+    $lines = @(
+        ('File: ' + [string]$planItem.Path),
+        ('Size: ' + (Format-Size -Bytes ([double]$planItem.SizeBytes))),
+        ('New place: ' + [string]$planItem.Target),
+        '',
+        'The file is copied, the copy is checked byte for byte, and only then the original goes to the Recycle Bin. This can take several minutes for a large file; the window shows progress and you can cancel.',
+        '',
+        'Move this file?'
+    )
+    $text = ($lines -join "`n")
+    $answer = [System.Windows.MessageBox]::Show($text, $caption, [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question, [System.Windows.MessageBoxResult]::No)
+    if ($answer -ne [System.Windows.MessageBoxResult]::Yes) {
+        $c['MoveMessage'].Text = 'Not moved: you chose No.'
+        return
+    }
+
+    $script:TriageBusy = $true
+    $script:TriageCancel = $false
+    $script:TriageMoveTicks = 0
+    $c['ScanButton'].IsEnabled = $false
+    $c['ExportButton'].IsEnabled = $false
+    Update-TriageAllActionButtons -Ui $ui
+    $c['MoveCancelButton'].IsEnabled = $true
+    $c['MoveMessage'].Text = 'Starting...'
+
+    $onProgress = {
+        param($stage, $done, $total)
+        $script:TriageMoveTicks = $script:TriageMoveTicks + 1
+        if (($script:TriageMoveTicks % 16) -ne 0) { return }
+        $t = ('{0}: {1} of {2}' -f [string]$stage, (Format-Size -Bytes ([double]$done)), (Format-Size -Bytes ([double]$total)))
+        $script:TriageUi.Controls['MoveMessage'].Text = $t
+        $script:TriageUi.Window.Dispatcher.Invoke([System.Action]{ }, [System.Windows.Threading.DispatcherPriority]::Background)
+    }
+
+    $record = $null
+    $failure = ''
+    $failed = $false
+    try {
+        $record = Move-TriageFile -Item $planItem -LogDirectory $script:TriageGuiReportDir -ShowDialogs -OnProgress $onProgress
+    }
+    catch {
+        $failed = $true
+        $failure = $_.Exception.Message
+    }
+    finally {
+        $script:TriageBusy = $false
+        $c['MoveCancelButton'].IsEnabled = $false
+        $c['ScanButton'].IsEnabled = $true
+        if ($null -ne $script:TriageLastResult) { $c['ExportButton'].IsEnabled = $true }
+        Update-TriageAllActionButtons -Ui $ui
+    }
+    if ($failed) {
+        $c['MoveMessage'].Text = ('Not moved: ' + $failure)
+        return
+    }
+
+    $remaining = @()
+    foreach ($p in @($script:TriageMovePlan)) {
+        if ([string]$p.Path -cne [string]$planItem.Path) { $remaining += $p }
+    }
+    $script:TriageMovePlan = $remaining
+    Set-TriageMoveRows -Ui $ui
+
+    if ($record.OriginalRecycled -eq $true) {
+        $message = ('Moved and verified: {0}. The original is in the Recycle Bin; empty it to free the space.' -f [string]$record.NewValue)
+    } else {
+        $message = ('Copied and verified: {0}. The original could NOT be sent to the Recycle Bin and is still at {1}; delete it yourself.' -f [string]$record.NewValue, [string]$record.OldValue)
+    }
+    if (([string]$record.LogPath).Length -gt 0) {
+        $message = $message + ' Change log: ' + [string]$record.LogPath
+    } else {
+        $message = $message + ' Note: this change could NOT be written to the change log (is the file open in another program?).'
+    }
+    $c['MoveMessage'].Text = $message
+    Update-TriageMoveButtons -Ui $ui
+}
+
 function Show-TriageWindow {
     param(
         [char]$SourceDrive = 'C',
@@ -2685,6 +3517,10 @@ function Show-TriageWindow {
     $script:TriageLastResult = $null
     $script:TriageCancel = $false
     $script:TriageRedirectPlan = @()
+    $script:TriageDeletePlan = @()
+    $script:TriageMovePlan = @()
+    $script:TriageBusy = $false
+    $script:TriageMoveTicks = 0
     $script:TriageRedirectHistory = New-Object 'System.Collections.Generic.List[object]'
     $c = $ui.Controls
 
@@ -2723,7 +3559,19 @@ function Show-TriageWindow {
     $c['EnableActionsBox'].Add_Checked({ Update-TriageRedirectButtons -Ui $script:TriageUi })
     $c['EnableActionsBox'].Add_Unchecked({ Update-TriageRedirectButtons -Ui $script:TriageUi })
     $c['RedirectGrid'].Add_SelectionChanged({ Update-TriageRedirectButtons -Ui $script:TriageUi })
-    Update-TriageRedirectButtons -Ui $ui
+    $c['DeleteStoreButton'].Add_Click({ Invoke-TriageGuiDeleteStore })
+    $c['EnableDeleteBox'].Add_Checked({ Update-TriageDeleteButtons -Ui $script:TriageUi })
+    $c['EnableDeleteBox'].Add_Unchecked({ Update-TriageDeleteButtons -Ui $script:TriageUi })
+    $c['DeleteGrid'].Add_SelectionChanged({ Update-TriageDeleteButtons -Ui $script:TriageUi })
+    $c['MoveFileButton'].Add_Click({ Invoke-TriageGuiMoveFile })
+    $c['MoveCancelButton'].Add_Click({
+        $script:TriageCancel = $true
+        $script:TriageUi.Controls['MoveMessage'].Text = 'Cancelling...'
+    })
+    $c['EnableMoveBox'].Add_Checked({ Update-TriageMoveButtons -Ui $script:TriageUi })
+    $c['EnableMoveBox'].Add_Unchecked({ Update-TriageMoveButtons -Ui $script:TriageUi })
+    $c['MoveGrid'].Add_SelectionChanged({ Update-TriageMoveButtons -Ui $script:TriageUi })
+    Update-TriageAllActionButtons -Ui $ui
     $ui.Window.Add_Closing({ $script:TriageCancel = $true })
 
     [void]$ui.Window.ShowDialog()
@@ -2749,6 +3597,10 @@ function Test-TriageGui {
     param([Parameter(Mandatory = $true)][string]$OutputPath)
     Initialize-TriageGui
     $script:TriageRedirectPlan = @()
+    $script:TriageDeletePlan = @()
+    $script:TriageMovePlan = @()
+    $script:TriageBusy = $false
+    $script:TriageMoveTicks = 0
     $script:TriageRedirectHistory = New-Object 'System.Collections.Generic.List[object]'
     $ui = New-TriageWindow
 
@@ -2763,6 +3615,8 @@ function Test-TriageGui {
     if ($ui.Controls['MechanismsGrid'].Items.Count -le 0) { throw 'GUI self-test: MechanismsGrid has no items.' }
     if ($ui.Controls['FilesGrid'].Items.Count -le 0) { throw 'GUI self-test: FilesGrid has no items.' }
     if ($ui.Controls['RedirectGrid'].Items.Count -le 0) { throw 'GUI self-test: RedirectGrid has no items.' }
+    if ($ui.Controls['DeleteGrid'].Items.Count -le 0) { throw 'GUI self-test: DeleteGrid has no items.' }
+    if ($ui.Controls['MoveGrid'].Items.Count -le 0) { throw 'GUI self-test: MoveGrid has no items.' }
 
     $w = $ui.Window
     $size = New-Object System.Windows.Size -ArgumentList @(1100.0, 700.0)
@@ -2774,15 +3628,18 @@ function Test-TriageGui {
 
     # One picture per tab that matters: the findings, and the only tab that
     # can change anything.
-    $fixPath = $OutputPath
+    $stem = $OutputPath
     if ($OutputPath.EndsWith('.png', [System.StringComparison]::OrdinalIgnoreCase)) {
-        $fixPath = $OutputPath.Substring(0, $OutputPath.Length - 4) + '-fix.png'
-    } else {
-        $fixPath = $OutputPath + '-fix.png'
+        $stem = $OutputPath.Substring(0, $OutputPath.Length - 4)
     }
+    $fixPath = $stem + '-fix.png'
+    $deletePath = $stem + '-delete.png'
+    $movePath = $stem + '-move.png'
     $shots = @(
         [pscustomobject]@{ Tab = 0; Path = $OutputPath }
         [pscustomobject]@{ Tab = 1; Path = $fixPath }
+        [pscustomobject]@{ Tab = 2; Path = $deletePath }
+        [pscustomobject]@{ Tab = 3; Path = $movePath }
     )
     foreach ($shot in $shots) {
         $ui.Controls['MainTabs'].SelectedIndex = $shot.Tab

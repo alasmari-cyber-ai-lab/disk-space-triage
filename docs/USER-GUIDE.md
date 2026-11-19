@@ -57,6 +57,39 @@ confirm.
   the old folder, the program carries on as before; anything it downloaded
   into the new folder in the meantime stays there.
 
+## Delete rebuildable folders (the tool does it for you)
+
+On the **Delete rebuildable folders** tab, tick the box, select a row marked
+Ready, and choose **Send selected to Recycle Bin**. The whole folder goes to
+the Recycle Bin; restore it from there if you change your mind, and empty the
+Recycle Bin to actually free the space.
+
+- Only folders that rebuild or refill by themselves are listed. A row marked
+  "Not possible" says why: no lockfile, something foreign inside, a link
+  inside, or unreadable content.
+- Close the application first for browser, Discord, Slack and Teams caches.
+- After removing `node_modules`, run `npm ci` in that project when you next
+  need it.
+- If Windows says the folder is too big for the Recycle Bin and offers to
+  delete it permanently, answer No unless you are sure.
+
+## Move files to the other drive (the tool does it for you)
+
+On the **Move files to the other drive** tab, tick the box, select a file
+marked Ready, and choose **Move selected file**. The file is copied to
+`D:\FromC\<same folders>`, the copy is checked byte for byte, and only then
+does the original go to the Recycle Bin.
+
+- You can cancel while it runs; the partial copy is removed and the original
+  stays.
+- Nothing is overwritten. If a file of that name is already there, the tool
+  stops and tells you.
+- Update anything that referred to the old path (a notebook, a config file).
+- Empty the Recycle Bin to free the space on C:.
+- Files that belong to a program, a game, a virtual machine, an iPhone backup
+  or a sync folder are not listed. Move those with the owning application,
+  as described below.
+
 ## Redirect: the common settings
 
 Set a user environment variable without administrator rights:

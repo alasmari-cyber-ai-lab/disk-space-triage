@@ -294,7 +294,7 @@ Describe '.NET surface' {
         $recycleFile.Count | Should -Be 1
         Get-EnclosingFunction -Node $recycleFile[0] | Should -Be 'Move-TriageFile'
         $recycleFile[0].Arguments[0].Extent.Text    | Should -Be '$source'
-        foreach ($call in @($recycleDir + $recycleFile)) {
+        foreach ($call in (@($recycleDir) + @($recycleFile))) {
             $call.Arguments.Count          | Should -Be 4
             $call.Arguments[2].Extent.Text | Should -Be '[Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin'
         }

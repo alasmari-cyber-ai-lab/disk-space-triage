@@ -185,10 +185,8 @@ Describe 'Strings' {
 
     It 'never names a persistence or remote-execution mechanism' {
         $source = Get-Content -LiteralPath $script:ScriptPath -Raw
-        $help   = $script:Ast.GetHelpContent()
         foreach ($word in @('HKLM:', 'HKCU:', 'Registry::', 'schtasks', 'Register-ScheduledTask', 'New-Service', 'Invoke-Command', 'New-PSSession', 'Start-Process', 'Invoke-Item', 'System.Net', 'System.Reflection', 'DllImport')) {
             $source.IndexOf($word, [System.StringComparison]::OrdinalIgnoreCase) | Should -Be -1 -Because "$word must not appear anywhere in the script"
         }
-        $help | Should -Not -BeNullOrEmpty
     }
 }

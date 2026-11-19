@@ -100,6 +100,13 @@ jobs:
         run: |
           & .\DiskSpaceTriage.ps1 -Mode SelfTest -ReportDirectory (Join-Path $env:RUNNER_TEMP 'scan') -AllowElevated
 
+      - name: Print the window screenshot (base64) for review from the log
+        run: |
+          $png = Join-Path $env:RUNNER_TEMP 'scan\selftest-window.png'
+          Write-Host '-----BEGIN PNG-----'
+          [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($png), 'InsertLineBreaks')
+          Write-Host '-----END PNG-----'
+
       - name: Refuses to run elevated without the override
         run: |
           powershell -NoProfile -File .\DiskSpaceTriage.ps1 -Mode Console

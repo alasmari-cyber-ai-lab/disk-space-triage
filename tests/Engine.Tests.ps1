@@ -68,8 +68,11 @@ Describe 'Invoke-TriageScan on a synthetic tree' {
         $script:Buckets['Delete'].TotalBytes | Should -Be (4096 + 8192)
     }
     It 'applies the file-type fallback to small files in unclassified folders' {
-        $script:Buckets['Move'].TotalBytes   | Should -Be (3MB + 1000 + 2048)
-        $script:Buckets['Review'].TotalBytes | Should -Be 1024
+        # The fixture's Downloads folder is not directly inside a real profile,
+        # so it is not a known folder: big.iso and table.parquet are Move by
+        # file type, small.txt and notes.xyz are Review.
+        $script:Buckets['Move'].TotalBytes   | Should -Be (3MB + 2048)
+        $script:Buckets['Review'].TotalBytes | Should -Be (1000 + 1024)
     }
     It 'lists only files at or above the size threshold' {
         @($script:Result.Files).Count | Should -Be 2

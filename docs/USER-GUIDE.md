@@ -19,13 +19,24 @@ on the other drive and sets one user variable; it shows both before you
 confirm.
 
 - The new folder keeps its name and place: `C:\Users\you\.cache\huggingface`
-  becomes `D:\FromC\Users\you\.cache\huggingface`. It can never collide with
-  a folder you already have, and its origin stays obvious.
+  becomes `D:\FromC\Users\you\.cache\huggingface`, so its origin stays
+  obvious. If that folder already exists with something in it, the tool
+  refuses and asks you to look first.
 - Nothing is moved or deleted. Close and reopen your terminals and
-  applications, use the tool once, and check that files appear in the new
-  folder. Then delete the old folder yourself.
-- **Undo last change** removes the variable again. Every change is listed in
-  `DiskTriage_actions.csv` next to your reports.
+  applications (or sign out and in), use the program once, and check that
+  files appear in the new folder.
+- **Then follow what the tool says about the old folder.** For a pure cache
+  (pip, uv, npm, NuGet, Go, Composer) delete it. For Ollama, move the models
+  across: models you created yourself cannot be downloaded again. For Hugging
+  Face, sign in again or copy the `token` file before deleting anything. For
+  Keras, copy `keras.json`.
+- **Undo last change** removes the variable again, until you close the
+  window. Later, remove it yourself under Settings > System > About >
+  Advanced system settings > Environment Variables, "User variables". Every
+  change is listed in `DiskTriage_actions.csv` next to your reports.
+- Use this on your own PC. On a shared computer the new folder may be
+  readable by other users (see SECURITY.md). The other drive must be an
+  internal NTFS disk that stays connected.
 
 ### What if a program insists on its C: path?
 
@@ -42,8 +53,9 @@ confirm.
   install it again on the other drive.
 - **If something misbehaves after a redirect**, use Undo last change (or
   delete the variable in Settings > System > About > Advanced system settings
-  > Environment Variables, under "User variables"). The old folder is still
-  in place, so the program carries on exactly as before.
+  > Environment Variables, under "User variables"). If you have not deleted
+  the old folder, the program carries on as before; anything it downloaded
+  into the new folder in the meantime stays there.
 
 ## Redirect: the common settings
 

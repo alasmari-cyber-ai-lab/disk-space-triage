@@ -66,7 +66,7 @@ BeforeAll {
         'ContainsKey', 'Dequeue', 'Dispose', 'EndsWith', 'Enqueue', 'EnumerateDirectories', 'EnumerateFiles',
         'FindName', 'FindResource', 'GetEnumerator', 'Invoke', 'IsInRole', 'IsMatch', 'LastIndexOf', 'Measure',
         'Render', 'Replace', 'Save', 'ShowDialog', 'StartsWith', 'Substring', 'ToArray', 'ToLowerInvariant',
-        'Add_Checked', 'Add_Unchecked', 'Split', 'RemoveAt',
+        'Add_Checked', 'Add_Unchecked', 'RemoveAt', 'EnumerateFileSystemInfos',
         'ToString', 'ToUpper', 'Trim', 'TrimEnd', 'UpdateLayout'
     )
 
@@ -228,6 +228,11 @@ Describe '.NET surface' {
             $call.Arguments.Count            | Should -Be 3
             $call.Arguments[0].Extent.Text   | Should -Be '$target.Variable' -Because 'the name must come from the fixed list, never from the caller'
             $call.Arguments[2].Extent.Text   | Should -Be "'User'"
+            if ((Get-EnclosingFunction -Node $call) -eq 'Set-TriageRedirect') {
+                $call.Arguments[1].Extent.Text | Should -Be '$value' -Because 'the value must be the folder recomputed inside the function'
+            } else {
+                $call.Arguments[1].Extent.Text | Should -Be '$null' -Because 'undo may only remove the variable'
+            }
         }
         $gets = @($script:Ast.FindAll({ param($n)
             $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and $n.Static -and
@@ -235,13 +240,16 @@ Describe '.NET surface' {
         foreach ($call in $gets) { $call.Arguments[1].Extent.Text | Should -BeIn @("'User'", "'Machine'") }
     }
 
-    It 'manages a fixed list of variables that excludes anything system-critical' {
+    It 'manages exactly this list of variables and no other' {
         . $script:ScriptPath -ImportOnly
-        $names = @($script:TriageRedirectTargets | ForEach-Object Variable)
-        $names.Count | Should -BeGreaterThan 5
-        foreach ($forbidden in @('PATH', 'PATHEXT', 'TEMP', 'TMP', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'ComSpec', 'PSModulePath', 'SystemRoot', 'windir', 'HOME', 'HOMEDRIVE', 'HOMEPATH', 'OneDrive')) {
-            $names | Should -Not -Contain $forbidden
-        }
+        $names = @($script:TriageRedirectTargets | ForEach-Object Variable | Sort-Object)
+        ($names -join ',') | Should -Be 'COMPOSER_CACHE_DIR,GOMODCACHE,HF_HOME,KERAS_HOME,NLTK_DATA,npm_config_cache,NUGET_PACKAGES,OLLAMA_MODELS,PIP_CACHE_DIR,TORCH_HOME,TRITON_CACHE_DIR,UV_CACHE_DIR'
+    }
+
+    It 'creates folders, and only folders, with one pinned command per place' {
+        $newItems = @($script:Commands | Where-Object { $_.GetCommandName() -eq 'New-Item' })
+        foreach ($c in $newItems) { ($c.Extent.Text -replace '\s+', ' ') | Should -Match '^New-Item -ItemType Directory -Path \$(value|target) -Force$' }
+        @($newItems | Where-Object { (Get-EnclosingFunction -Node $_) -eq 'Set-TriageRedirect' }).Count | Should -Be 1
     }
 
     It 'creates a file stream in exactly one place: the self-test screenshot' {

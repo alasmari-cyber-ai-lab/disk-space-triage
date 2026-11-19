@@ -1,8 +1,9 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-    Disk Space Triage - a read-only tool that shows what is filling a Windows
-    system drive and how each item can leave it safely.
+    Disk Space Triage - shows what is filling a Windows system drive and how
+    each item can leave it safely. The scan is read-only; the tool never moves
+    or deletes anything.
 
 .DESCRIPTION
     Every finding is sorted into one of five buckets:
@@ -48,7 +49,8 @@
     Drive letter to analyse. Default C.
 
 .PARAMETER DestinationDrive
-    Drive letter you intend to relocate to. Checked for capacity only.
+    Drive letter you intend to relocate to. The scan only checks its capacity;
+    confirmed redirects create empty folders below <drive>:\FromC on it.
 
 .PARAMETER MinSizeMB
     Smallest individual file listed. Smaller files still count in all totals.
@@ -101,6 +103,9 @@ $script:TriageVersion = '1.0.0'
 $script:TriageCancel  = $false
 $script:TriageUi      = $null
 $script:TriageLastResult = $null
+$script:TriageRedirectPlan    = @()
+$script:TriageRedirectHistory = $null
+$script:TriageScanning        = $false
 $script:TriageGuiRoots       = @($AdditionalRoot)
 $script:TriageGuiSkipDefault = [bool]$SkipDefaultRoots
 $script:TriageGuiReportDir   = $ReportDirectory
@@ -899,8 +904,9 @@ function ConvertTo-TriageMarkdown {
 
 function Export-TriageReport {
     <#
-        Writes the HTML, Markdown and CSV reports. These three files are the
-        only thing this tool ever writes.
+        Writes the HTML, Markdown and CSV reports. Apart from the action log
+        and the empty folders of confirmed redirects, these are the only files
+        this tool writes.
     #>
     param([Parameter(Mandatory)] $Result, [string]$Directory)
 
@@ -927,30 +933,69 @@ function Export-TriageReport {
 # removes it. Every change is written to an action log so it can be undone.
 
 function New-TriageRedirectTarget {
-    param([string]$Variable, [string]$Mechanism, [string]$RelativePath, [string]$Effect)
-    [pscustomobject]@{ Variable = $Variable; Mechanism = $Mechanism; RelativePath = $RelativePath; Effect = $Effect }
+    param([string]$Variable, [string]$Mechanism, [string]$RelativePath, [string]$Effect, [string]$OldFolder)
+    [pscustomobject]@{ Variable = $Variable; Mechanism = $Mechanism; RelativePath = $RelativePath; Effect = $Effect; OldFolder = $OldFolder }
 }
 
-# Only stores that are pure caches or re-downloadable, and whose location is
-# controlled by one environment variable. Stores that also hold tools on PATH,
-# credentials or project data (CARGO_HOME, GRADLE_USER_HOME, GEM_HOME, Poetry,
-# Docker, WSL ...) are deliberately absent and stay manual.
+# Only stores whose location is controlled by one environment variable and
+# where pointing it elsewhere cannot break the tool. Stores that also hold
+# tools on PATH, credentials or project data (CARGO_HOME, GRADLE_USER_HOME,
+# GEM_HOME, Poetry, Yarn, TensorFlow Datasets, Docker, WSL ...) are
+# deliberately absent and stay manual. The last column is what to do with the
+# old folder afterwards; it is never "delete" for a store that can hold
+# something that cannot be downloaded again.
 $script:TriageRedirectTargets = @(
-    New-TriageRedirectTarget 'HF_HOME'            'HF_HOME'              '.cache\huggingface'       'New downloads go to the new folder. Your Hugging Face sign-in token lives in the old folder: sign in again, or copy the file named token across.'
-    New-TriageRedirectTarget 'TORCH_HOME'         'TORCH_HOME'           '.cache\torch'             'Pretrained weights download again on first use.'
-    New-TriageRedirectTarget 'KERAS_HOME'         'KERAS_HOME'           '.keras'                   'Keras datasets and weights download again. Copy keras.json across if you changed it.'
-    New-TriageRedirectTarget 'TFDS_DATA_DIR'      'TFDS_DATA_DIR'        'tensorflow_datasets'      'Datasets download and prepare again unless you move them.'
-    New-TriageRedirectTarget 'NLTK_DATA'          'NLTK_DATA'            'AppData\Roaming\nltk_data' 'Corpora must be downloaded again or moved.'
-    New-TriageRedirectTarget 'OLLAMA_MODELS'      'OLLAMA_MODELS'        '.ollama\models'           'Restart Ollama. Models download again unless you move the contents of the old folder.'
-    New-TriageRedirectTarget 'TRITON_CACHE_DIR'   'TRITON_CACHE_DIR'     '.triton\cache'            'The cache refills on next use.'
-    New-TriageRedirectTarget 'PIP_CACHE_DIR'      'PIP_CACHE_DIR'        'AppData\Local\pip\Cache'  'The cache refills on next install.'
-    New-TriageRedirectTarget 'UV_CACHE_DIR'       'UV_CACHE_DIR'         'AppData\Local\uv\cache'   'The cache refills on next install.'
-    New-TriageRedirectTarget 'NUGET_PACKAGES'     'NUGET_PACKAGES'       '.nuget\packages'          'Packages restore again on the next build.'
-    New-TriageRedirectTarget 'GOMODCACHE'         'GOMODCACHE'           'go\pkg\mod'               'Modules download again on the next build.'
-    New-TriageRedirectTarget 'COMPOSER_CACHE_DIR' 'COMPOSER_CACHE_DIR'   'AppData\Local\Composer'   'The cache refills on next install.'
-    New-TriageRedirectTarget 'npm_config_cache'   'npm config set cache' 'AppData\Local\npm-cache'  'The cache refills on next install.'
-    New-TriageRedirectTarget 'YARN_CACHE_FOLDER'  'yarn cache-folder'    'AppData\Local\Yarn\Cache' 'The cache refills on next install.'
+    New-TriageRedirectTarget 'PIP_CACHE_DIR'      'PIP_CACHE_DIR'        'AppData\Local\pip\Cache'  'The cache refills on the next install.' 'It is a pure cache: once new files appear in the new folder, you can delete the old one.'
+    New-TriageRedirectTarget 'UV_CACHE_DIR'       'UV_CACHE_DIR'         'AppData\Local\uv\cache'   'The cache refills on the next install. If your projects stay on this drive, uv copies packages into each environment instead of linking them, so environments get larger.' 'It is a pure cache: once new files appear in the new folder, you can delete the old one.'
+    New-TriageRedirectTarget 'npm_config_cache'   'npm config set cache' 'AppData\Local\npm-cache'  'The cache refills on the next install.' 'It is a pure cache: once new files appear in the new folder, you can delete the old one.'
+    New-TriageRedirectTarget 'NUGET_PACKAGES'     'NUGET_PACKAGES'       '.nuget\packages'          'Restart Visual Studio. Packages restore again on the next build.' 'It is a pure cache: after a successful build, you can delete the old one.'
+    New-TriageRedirectTarget 'GOMODCACHE'         'GOMODCACHE'           'go\pkg\mod'               'Modules download again on the next build.' 'It is a pure cache: after a successful build, you can delete the old one (go clean -modcache does it; the files are read-only).'
+    New-TriageRedirectTarget 'COMPOSER_CACHE_DIR' 'COMPOSER_CACHE_DIR'   'AppData\Local\Composer'   'The cache refills on the next install.' 'It is a pure cache: once new files appear in the new folder, you can delete the old one.'
+    New-TriageRedirectTarget 'TRITON_CACHE_DIR'   'TRITON_CACHE_DIR'     '.triton\cache'            'The cache refills on next use.' 'It is a pure cache: you can delete the old one.'
+    New-TriageRedirectTarget 'TORCH_HOME'         'TORCH_HOME'           '.cache\torch'             'Pretrained weights download again on first use.' 'Weights you downloaded come back by themselves. Delete the old folder only if you put nothing of your own in it.'
+    New-TriageRedirectTarget 'HF_HOME'            'HF_HOME'              '.cache\huggingface'       'New downloads go to the new folder. Your Hugging Face sign-in token is in the old folder, so sign in again or copy the file named token across. If you also set HF_HUB_CACHE or TRANSFORMERS_CACHE, those still win.' 'Do NOT delete the old folder straight away: it holds your sign-in token and may hold models that are no longer downloadable. Move what you need, then delete it.'
+    New-TriageRedirectTarget 'KERAS_HOME'         'KERAS_HOME'           '.keras'                   'Keras datasets and weights download again. Copy the file keras.json into the new folder, or Keras falls back to its default backend.' 'Copy keras.json across first. After that the old folder can be deleted.'
+    New-TriageRedirectTarget 'NLTK_DATA'          'NLTK_DATA'            'AppData\Roaming\nltk_data' 'New corpus downloads go to the new folder. Corpora already in the old folder keep working while it exists.' 'Keep the old folder, or move its contents into the new one before deleting it.'
+    New-TriageRedirectTarget 'OLLAMA_MODELS'      'OLLAMA_MODELS'        '.ollama\models'           'Quit Ollama from the system tray and start it again. It will then look for models only in the new folder.' 'Do NOT delete the old folder: move its contents into the new one. Models you created or imported yourself cannot be downloaded again.'
 )
+
+function Get-TriageProfileName {
+    if (-not $env:USERPROFILE) { return '' }
+    return [System.IO.Path]::GetFileName($env:USERPROFILE.TrimEnd('\'))
+}
+
+function Get-TriageRedirectFolder {
+    # The one folder this tool will ever create for a target on a given drive.
+    param([string]$Letter, $Target)
+    return ('{0}:\FromC\Users\{1}\{2}' -f $Letter.ToUpper(), (Get-TriageProfileName), $Target.RelativePath)
+}
+
+function Test-TriageRedirectDrive {
+    <#
+        Returns '' when the drive may hold redirected stores, otherwise the
+        reason it may not. It must be a local fixed NTFS or ReFS disk and must
+        not be the drive that holds Windows or the user profile.
+    #>
+    param([string]$Letter)
+    $facts = Get-DriveFacts -Letter $Letter
+    if ($null -eq $facts)          { return 'The destination drive is not available.' }
+    if ($facts.Type -ne 'Fixed')   { return 'The destination is not a local fixed disk.' }
+    if ($facts.Format -ne 'NTFS' -and $facts.Format -ne 'ReFS') { return "The destination is formatted $($facts.Format); NTFS is required." }
+    $upper = $Letter.ToUpper()
+    if ($env:USERPROFILE -and $env:USERPROFILE.Substring(0, 1).ToUpper() -eq $upper) { return 'The destination is the drive that holds your user profile.' }
+    if ($env:SystemDrive -and $env:SystemDrive.Substring(0, 1).ToUpper() -eq $upper)  { return 'The destination is the Windows drive.' }
+    return ''
+}
+
+function Test-TriageFolderEmpty {
+    # True when the folder does not exist, or exists as a folder with nothing in it.
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $true }
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { return $false }
+    $info = New-Object System.IO.DirectoryInfo $Path
+    foreach ($entry in $info.EnumerateFileSystemInfos()) { return $false }
+    return $true
+}
 
 function Test-TriageLinkInPath {
     # True when the path, or any existing folder above it, is a junction or
@@ -979,13 +1024,16 @@ function Get-TriageRedirectPlan {
     param([Parameter(Mandatory)] $Result, [string]$DestinationDrive)
 
     $letter = $DestinationDrive
-    if ([string]::IsNullOrWhiteSpace($letter) -and $null -ne $Result.Destination) { $letter = $Result.Destination.Letter }
+    if ([string]::IsNullOrWhiteSpace($letter) -and $null -ne $Result.Destination) { $letter = [string]$Result.Destination.Letter }
 
-    $destination = $null
-    if (-not [string]::IsNullOrWhiteSpace($letter)) { $destination = Get-DriveFacts -Letter $letter }
-
-    $profileName = 'user'
-    if ($env:USERPROFILE) { $profileName = [System.IO.Path]::GetFileName($env:USERPROFILE.TrimEnd('\')) }
+    $driveProblem = 'The destination drive is not available.'
+    $destination  = $null
+    if (-not [string]::IsNullOrWhiteSpace($letter)) {
+        $driveProblem = Test-TriageRedirectDrive -Letter $letter
+        $destination  = Get-DriveFacts -Letter $letter
+        if ($driveProblem -eq '' -and $letter.ToUpper() -eq [string]$Result.Source.Letter) { $driveProblem = 'The destination is the drive being cleaned.' }
+    }
+    if ((Get-TriageProfileName) -eq '') { $driveProblem = 'Your user profile folder could not be determined.' }
 
     $plan = foreach ($target in $script:TriageRedirectTargets) {
         $bytes = [long]0
@@ -994,38 +1042,40 @@ function Get-TriageRedirectPlan {
         }
         if ($bytes -le 0) { continue }
 
+        $source   = Join-Path ([string]$env:USERPROFILE) $target.RelativePath
         $current  = [string][Environment]::GetEnvironmentVariable($target.Variable, 'User')
         $machine  = [string][Environment]::GetEnvironmentVariable($target.Variable, 'Machine')
         $proposed = ''
         $state    = 'Ready'
         $reason   = ''
 
-        if ($null -eq $destination) {
-            $state = 'Blocked'; $reason = 'The destination drive is not available.'
-        } elseif ($destination.Type -ne 'Fixed') {
-            $state = 'Blocked'; $reason = 'The destination is not a local fixed disk.'
-        } elseif ($destination.Letter -eq $Result.Source.Letter) {
-            $state = 'Blocked'; $reason = 'The destination is the drive being cleaned.'
+        if ($driveProblem -ne '') {
+            $state = 'Blocked'; $reason = $driveProblem
         } else {
-            $proposed = '{0}:\FromC\Users\{1}\{2}' -f $destination.Letter, $profileName, $target.RelativePath
+            $proposed = Get-TriageRedirectFolder -Letter $letter -Target $target
             if (-not [string]::IsNullOrEmpty($current)) {
                 $state = 'AlreadySet'; $reason = 'This variable is already set for your account. Change it yourself if it points at the wrong place.'
             } elseif (-not [string]::IsNullOrEmpty($machine)) {
                 $state = 'Blocked'; $reason = 'This variable is set for the whole computer by an administrator.'
+            } elseif (-not (Test-Path -LiteralPath $source -PathType Container)) {
+                $state = 'Blocked'; $reason = 'This store was found, but not in its usual folder. Redirect it yourself (see the user guide).'
             } elseif (Test-TriageLinkInPath -Path $proposed) {
                 $state = 'Blocked'; $reason = 'The new folder would sit below a junction or symbolic link.'
-            } elseif ($destination.FreeBytes -lt $bytes) {
-                $reason = 'Note: the destination has less free space than this store uses now.'
+            } elseif (-not (Test-TriageFolderEmpty -Path $proposed)) {
+                $state = 'Blocked'; $reason = 'The new folder already exists and is not empty. Check what is in it first.'
+            } elseif ($null -ne $destination -and $destination.FreeBytes -lt $bytes) {
+                $reason = 'the destination has less free space than this store uses now'
             }
         }
 
         [pscustomobject]@{
             Variable      = $target.Variable
             SizeBytes     = $bytes
-            SourceFolder  = (Join-Path ([string]$env:USERPROFILE) $target.RelativePath)
+            SourceFolder  = $source
             CurrentValue  = $current
             ProposedValue = $proposed
             Effect        = $target.Effect
+            OldFolder     = $target.OldFolder
             State         = $state
             Reason        = $reason
         }
@@ -1053,19 +1103,27 @@ function Set-TriageRedirect {
     $target = $script:TriageRedirectTargets | Where-Object { $_.Variable -ceq [string]$Item.Variable }
     if ($null -eq $target) { throw "Not a variable this tool manages: $($Item.Variable)" }
 
-    $value = [string]$Item.ProposedValue
-    if ($value -notmatch '^[A-Za-z]:\\FromC\\Users\\[^\\/:*?"<>|]+\\' -or $value.Contains('..')) {
-        throw "Refused: the new folder must be below <drive>:\FromC\Users. Got: $value"
-    }
-    if (-not $value.EndsWith('\' + $target.RelativePath, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "Refused: the new folder does not match the store for $($target.Variable)."
-    }
-    $volume = Get-DriveFacts -Letter $value.Substring(0, 1)
-    if ($null -eq $volume -or $volume.Type -ne 'Fixed') { throw "Refused: $($value.Substring(0, 2)) is not a local fixed disk." }
+    # The caller supplies only the drive letter. The folder is recomputed here
+    # and must equal what the plan showed, so nothing but the one expected
+    # folder for this store can ever be created or assigned.
+    $shown = [string]$Item.ProposedValue
+    if ($shown -notmatch '^[A-Za-z]:\\') { throw "Refused: not a full local path: $shown" }
+    $letter = $shown.Substring(0, 1)
+    $value  = Get-TriageRedirectFolder -Letter $letter -Target $target
+    if ($shown -cne $value) { throw "Refused: the new folder must be exactly $value. Got: $shown" }
+
+    $driveProblem = Test-TriageRedirectDrive -Letter $letter
+    if ($driveProblem -ne '') { throw "Refused: $driveProblem" }
     if (Test-TriageLinkInPath -Path $value) { throw "Refused: the new folder would sit below a junction or symbolic link: $value" }
+    if (-not (Test-TriageFolderEmpty -Path $value)) { throw "Refused: the new folder already exists and is not empty: $value" }
 
     $old = [string][Environment]::GetEnvironmentVariable($target.Variable, 'User')
     if (-not [string]::IsNullOrEmpty($old)) { throw "Refused: $($target.Variable) is already set to $old. Nothing was changed." }
+    $machine = [string][Environment]::GetEnvironmentVariable($target.Variable, 'Machine')
+    if (-not [string]::IsNullOrEmpty($machine)) { throw "Refused: $($target.Variable) is set for the whole computer. Nothing was changed." }
+
+    # No change without a place to record it.
+    $logTarget = Resolve-ReportDirectory -Requested $LogDirectory
 
     if (-not (Test-Path -LiteralPath $value)) { New-Item -ItemType Directory -Path $value -Force | Out-Null }
     [Environment]::SetEnvironmentVariable($target.Variable, $value, 'User')
@@ -1078,7 +1136,7 @@ function Set-TriageRedirect {
         NewValue = $value
         LogPath  = ''
     }
-    try { $record.LogPath = Write-TriageActionLog -Record $record -Directory $LogDirectory } catch { $record.LogPath = '' }
+    try { $record.LogPath = Write-TriageActionLog -Record $record -Directory $logTarget } catch { $record.LogPath = '' }
     return $record
 }
 
@@ -2010,16 +2068,16 @@ $script:TriageXaml = @'
           </Grid.RowDefinitions>
           <Border Grid.Row="0" Margin="12,12,12,10" Padding="14,8,14,8" Background="#FFF3D1" BorderBrush="#C8962B" BorderThickness="4,1,1,1" CornerRadius="6">
             <StackPanel>
-              <TextBlock TextWrapping="Wrap" FontSize="12.5" Foreground="{StaticResource InkBrush}" Text="The tool can set a user environment variable so a cache is stored on the other drive from now on. It creates an empty folder there and sets the variable. It does not move or delete anything: the old folder stays on C: until you remove it yourself. Each change asks for confirmation and can be undone."/>
+              <TextBlock TextWrapping="Wrap" FontSize="12.5" Foreground="{StaticResource InkBrush}" Text="The tool can set a user environment variable so a cache is stored on the other drive from now on. It creates an empty folder there and sets the variable. It does not move or delete anything: the old folder stays where it is, and the tool tells you what to do with it. Each change asks for confirmation and can be undone until you close this window."/>
               <CheckBox x:Name="EnableActionsBox" Content="Allow this tool to make these changes" IsChecked="False" Margin="0,8,0,0" FontWeight="SemiBold" Foreground="{StaticResource InkBrush}"/>
             </StackPanel>
           </Border>
           <DataGrid x:Name="RedirectGrid" Grid.Row="1" Style="{StaticResource GridStyle}" AutoGenerateColumns="False" IsReadOnly="True" CanUserAddRows="False" HeadersVisibility="Column" GridLinesVisibility="Horizontal" SelectionMode="Single">
             <DataGrid.Columns>
-              <DataGridTextColumn Header="Size on C:" Binding="{Binding SizeText, Mode=OneWay}" SortMemberPath="SizeBytes" Width="100" ElementStyle="{StaticResource CellRight}" HeaderStyle="{StaticResource HeaderRight}"/>
+              <DataGridTextColumn Header="Size now" Binding="{Binding SizeText, Mode=OneWay}" SortMemberPath="SizeBytes" Width="100" ElementStyle="{StaticResource CellRight}" HeaderStyle="{StaticResource HeaderRight}"/>
               <DataGridTextColumn Header="Variable" Binding="{Binding Variable, Mode=OneWay}" Width="150" ElementStyle="{StaticResource CellBold}"/>
-              <DataGridTextColumn Header="New folder" Binding="{Binding ProposedValue, Mode=OneWay}" Width="2*" MinWidth="200" ElementStyle="{StaticResource CellTrim}"/>
-              <DataGridTextColumn Header="Status" Binding="{Binding StatusText, Mode=OneWay}" Width="190" ElementStyle="{StaticResource CellWrap}"/>
+              <DataGridTextColumn Header="New folder" Binding="{Binding ProposedValue, Mode=OneWay}" Width="3*" MinWidth="300" ElementStyle="{StaticResource CellWrap}"/>
+              <DataGridTextColumn Header="Status" Binding="{Binding StatusText, Mode=OneWay}" Width="120" ElementStyle="{StaticResource CellWrap}"/>
               <DataGridTextColumn Header="What happens" Binding="{Binding Effect, Mode=OneWay}" Width="2*" MinWidth="260" ElementStyle="{StaticResource CellWrap}"/>
             </DataGrid.Columns>
           </DataGrid>
@@ -2226,14 +2284,14 @@ function Set-TriageFilesGrid {
 function Update-TriageRedirectButtons {
     param([Parameter(Mandatory = $true)][hashtable]$Ui)
     $c = $Ui.Controls
-    $on = ($c['EnableActionsBox'].IsChecked -eq $true)
+    $on = ($c['EnableActionsBox'].IsChecked -eq $true) -and (-not $script:TriageScanning)
     $canApply = $false
     $selected = $c['RedirectGrid'].SelectedItem
     if ($on -and $null -ne $selected) {
         if ([string]$selected.State -eq 'Ready') { $canApply = $true }
     }
     $canUndo = $false
-    if ($on -and $script:TriageRedirectHistory.Count -gt 0) { $canUndo = $true }
+    if ($on -and $null -ne $script:TriageRedirectHistory -and $script:TriageRedirectHistory.Count -gt 0) { $canUndo = $true }
     $c['ApplyRedirectButton'].IsEnabled = $canApply
     $c['UndoRedirectButton'].IsEnabled = $canUndo
 }
@@ -2276,6 +2334,8 @@ function Update-TriageRedirectGrid {
             SizeBytes     = [long]$p.SizeBytes
             ProposedValue = [string]$p.ProposedValue
             Effect        = [string]$p.Effect
+            OldFolder     = [string]$p.OldFolder
+            SourceFolder  = [string]$p.SourceFolder
             State         = $state
             StatusText    = $status
             Reason        = $reason
@@ -2386,20 +2446,20 @@ function Invoke-TriageGuiScan {
         [void][System.Windows.MessageBox]::Show('Source and destination must be different drives.', $caption, [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
         return
     }
-    if ($minText -notmatch '^[0-9]{1,7}$' -or [int]$minText -lt 1) {
-        [void][System.Windows.MessageBox]::Show('Min file size must be a whole number of megabytes, 1 or more.', $caption, [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+    if ($minText -notmatch '^[0-9]{1,7}$' -or [int]$minText -lt 1 -or [int]$minText -gt 1048576) {
+        [void][System.Windows.MessageBox]::Show('Min file size must be a whole number of megabytes between 1 and 1048576.', $caption, [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
         return
     }
     $minMb = [int]$minText
 
     $extraRoots = @()
     foreach ($part in (([string]$c['ExtraRootsBox'].Text) -split ';')) {
-        $trimmed = ([string]$part).Trim()
+        $trimmed = ([string]$part).Trim().Trim('"').Trim()
         if ($trimmed.Length -gt 0) { $extraRoots += $trimmed }
     }
     foreach ($folder in $extraRoots) {
-        if ($folder -notmatch '^[A-Za-z]:\\') {
-            [void][System.Windows.MessageBox]::Show(('Extra folders must be full paths that start with a drive letter, for example D:\Models. Not valid: ' + $folder), $caption, [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+        if (-not $folder.StartsWith($src + ':\', [System.StringComparison]::OrdinalIgnoreCase)) {
+            [void][System.Windows.MessageBox]::Show(('Extra folders must be full paths on the source drive, for example ' + $src.ToUpper() + ':\ComfyUI. Not valid: ' + $folder), $caption, [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
             return
         }
     }
@@ -2414,6 +2474,11 @@ function Invoke-TriageGuiScan {
     $script:TriageCancel = $false
     $c['ScanButton'].IsEnabled = $false
     $c['CancelButton'].IsEnabled = $true
+    # Nothing else may be started while the scan runs.
+    $c['ExportButton'].IsEnabled = $false
+    $c['ApplyRedirectButton'].IsEnabled = $false
+    $c['UndoRedirectButton'].IsEnabled = $false
+    $script:TriageScanning = $true
     $c['ProgressText'].Text = 'Starting scan...'
 
     $onProgress = {
@@ -2446,8 +2511,11 @@ function Invoke-TriageGuiScan {
         [void][System.Windows.MessageBox]::Show(('The scan failed: ' + $msg), $caption, [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
     }
     finally {
+        $script:TriageScanning = $false
         $c['ScanButton'].IsEnabled = $true
         $c['CancelButton'].IsEnabled = $false
+        if ($null -ne $script:TriageLastResult) { $c['ExportButton'].IsEnabled = $true }
+        Update-TriageRedirectButtons -Ui $ui
     }
 }
 
@@ -2512,21 +2580,23 @@ function Invoke-TriageGuiApplyRedirect {
     $lines = @(
         ('Variable: ' + [string]$planItem.Variable),
         ('New folder: ' + [string]$planItem.ProposedValue),
+        ('Old folder (stays as it is): ' + [string]$planItem.SourceFolder),
         '',
         'Nothing will be moved or deleted.',
         [string]$planItem.Effect,
         '',
-        "You can undo this with 'Undo last change'.",
+        'The new folder is outside your user profile. On a shared computer, other users of this PC may be able to read or change it. If the drive is external, keep it connected.',
+        '',
+        "You can undo this with 'Undo last change' until you close this window.",
         '',
         'Make this change?'
     )
     $text = ($lines -join "`n")
-    $answer = [System.Windows.MessageBox]::Show($text, $caption, [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
+    $answer = [System.Windows.MessageBox]::Show($text, $caption, [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question, [System.Windows.MessageBoxResult]::No)
     if ($answer -ne [System.Windows.MessageBoxResult]::Yes) {
         $c['RedirectMessage'].Text = 'Not changed: you chose No.'
         return
     }
-
     $record = $null
     $failure = ''
     try {
@@ -2544,8 +2614,12 @@ function Invoke-TriageGuiApplyRedirect {
     if ($null -ne $script:TriageLastResult) {
         Update-TriageRedirectGrid -Ui $ui -Result $script:TriageLastResult
     }
-    $message = ('{0} now points to {1}. Close and reopen your terminals and apps so they see it. When new downloads appear in the new folder, you can delete the old one: {2}.' -f [string]$record.Variable, [string]$record.NewValue, [string]$planItem.SourceFolder)
-    if (([string]$record.LogPath).Length -gt 0) { $message = $message + ' Change log: ' + [string]$record.LogPath }
+    $message = ('{0} now points to {1}. Close and reopen your terminals and apps (or sign out and in) so they see it. The old folder is still at {2}. {3}' -f [string]$record.Variable, [string]$record.NewValue, [string]$planItem.SourceFolder, [string]$planItem.OldFolder)
+    if (([string]$record.LogPath).Length -gt 0) {
+        $message = $message + ' Change log: ' + [string]$record.LogPath
+    } else {
+        $message = $message + ' Note: this change could NOT be written to the change log (is the file open in another program?).'
+    }
     $c['RedirectMessage'].Text = $message
     Update-TriageRedirectButtons -Ui $ui
 }
@@ -2563,12 +2637,12 @@ function Invoke-TriageGuiUndoRedirect {
     $lines = @(
         ('Undo the change to ' + [string]$record.Variable + '?'),
         '',
-        ('The variable will be removed again. The folder ' + [string]$record.NewValue + ' stays where it is.'),
+        ('The variable will be removed again. The folder ' + [string]$record.NewValue + ' stays where it is; anything downloaded into it since stays there too.'),
         '',
         'Undo this change?'
     )
     $text = ($lines -join "`n")
-    $answer = [System.Windows.MessageBox]::Show($text, $caption, [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
+    $answer = [System.Windows.MessageBox]::Show($text, $caption, [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question, [System.Windows.MessageBoxResult]::No)
     if ($answer -ne [System.Windows.MessageBoxResult]::Yes) {
         $c['RedirectMessage'].Text = 'Not undone: you chose No.'
         return
@@ -2584,7 +2658,10 @@ function Invoke-TriageGuiUndoRedirect {
         $failure = $_.Exception.Message
     }
     if ($failure.Length -gt 0) {
-        $c['RedirectMessage'].Text = ('Not undone: ' + $failure)
+        # A record that can no longer be undone must not block the ones before it.
+        $script:TriageRedirectHistory.RemoveAt($count - 1)
+        $c['RedirectMessage'].Text = ('Not undone: ' + $failure + ' To remove it yourself: Settings > System > About > Advanced system settings > Environment Variables, under User variables.')
+        Update-TriageRedirectButtons -Ui $ui
         return
     }
 

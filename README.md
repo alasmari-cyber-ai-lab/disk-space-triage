@@ -2,8 +2,8 @@
 
 [![CI](https://github.com/alasmari-cyber-ai-lab/disk-space-triage/actions/workflows/ci.yml/badge.svg)](https://github.com/alasmari-cyber-ai-lab/disk-space-triage/actions/workflows/ci.yml)
 
-A read-only Windows tool that shows what is filling your system drive and how
-each item can leave it safely. Built for machines that do ML and LLM work,
+A Windows tool that shows what is filling your system drive and how each item
+can leave it safely. Its scan is read-only. Built for machines that do ML and LLM work,
 where model caches, package caches, container disks and virtual environments
 fill `C:` faster than anything a normal cleanup tool looks for.
 
@@ -76,8 +76,13 @@ fixed list of cache stores (`HF_HOME`, `TORCH_HOME`, `PIP_CACHE_DIR`,
 That is all. It does not move or delete the old folder, it never touches a
 variable you have already set, it needs no administrator rights, it asks
 before every change, it writes each change to `DiskTriage_actions.csv`, and
-**Undo last change** removes the variable again. Stores that also hold tools,
-credentials or your own data (Cargo, Gradle, Docker, WSL, games) are not on
+**Undo last change** removes the variable again (until you close the window;
+after that, remove it under Settings > System > About > Advanced system
+settings > Environment Variables). After each change it tells you what to do
+with the old folder: delete it for a pure cache, move its contents for stores
+such as Ollama models or the Hugging Face folder, which holds your sign-in
+token. The other drive must be a local NTFS disk, and not the Windows drive. Stores that also hold tools,
+credentials or your own data (Cargo, Gradle, Yarn, TensorFlow Datasets, Docker, WSL, games) are not on
 the list and stay manual.
 
 ## Why you can trust it
@@ -88,7 +93,7 @@ These are properties of the code, checked on every commit, not promises.
 | --- | --- |
 | No network access | [`tests/Capability.Tests.ps1`](tests/Capability.Tests.ps1) parses the script and fails the build if any command, .NET type, static call or instance method outside a short allowlist appears. Only local fixed disks are scanned; network drives are refused. CI also runs a real scan with outbound traffic blocked by the firewall. |
 | Never moves or deletes; the scan is read-only | Same allowlist: no move, copy, delete or open call exists in the script. A test compares the names, sizes and timestamps of a scanned tree before and after. |
-| Changes only what you confirm | The single setter call may appear in exactly two functions, must take its variable name from the fixed list and must target the current user. Tests set a real variable, check the refusals (unknown variable, folder outside `FromC`, already set) and undo it. |
+| Changes only what you confirm | The single setter call may appear in exactly two functions, must take its variable name from a list of twelve names pinned by a test, its value from the folder recomputed inside the function, and must target the current user. On CI the tests set a real variable, check the refusals (unknown variable, any other folder, the Windows drive, a non-empty folder, already set) and undo it. |
 | Never reads file contents | Only names, sizes, timestamps and attributes are accessed. |
 | No administrator rights | It refuses to start elevated. CI checks the refusal. |
 | No hidden code | No `Invoke-Expression`, compiled C#, reflection, COM or external processes. One `Add-Type` call loads the WPF assemblies that ship with Windows; the test pins that line exactly. |

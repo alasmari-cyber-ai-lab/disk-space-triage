@@ -24,15 +24,35 @@ BeforeAll {
     $base = $env:RUNNER_TEMP
     if ([string]::IsNullOrWhiteSpace($base)) { $base = $env:PUBLIC }
     $script:LogDir = Join-Path $base ('triage-actions-' + [guid]::NewGuid().ToString('N'))
-    $script:Folder = "$($script:Dest):\FromC\Users\triage-ci-test"
-    $script:Value  = "$script:Folder\.triton\cache"
+    $script:Target = $script:TriageRedirectTargets | Where-Object Variable -eq $script:Var
+    $script:Value  = ''
+    $script:Store  = ''
+    $script:MadeStore = $false
+    if ($script:Dest) {
+        # The only folder the tool will accept for this store on this drive.
+        $script:Value = Get-TriageRedirectFolder -Letter $script:Dest -Target $script:Target
+        $script:Store = Split-Path -Parent $script:Value          # ...\.triton
+        $script:MadeStore = -not (Test-Path -LiteralPath $script:Store)
+    }
+    # The plan only offers a store that exists in its usual place.
+    $script:HfSource = Join-Path $env:USERPROFILE '.cache\huggingface'
+    $script:MadeHf   = -not (Test-Path -LiteralPath $script:HfSource)
+    if ($script:MadeHf) { New-Item -ItemType Directory -Path $script:HfSource -Force | Out-Null }
 }
 
 AfterAll {
     [Environment]::SetEnvironmentVariable($script:Var, $script:Saved, 'User')
     [Environment]::SetEnvironmentVariable('HF_HOME', $script:SavedHf, 'User')
-    if ($script:Folder -and (Test-Path -LiteralPath $script:Folder)) { Remove-Item -LiteralPath $script:Folder -Recurse -Force }
+    # Remove only what this test run created.
+    if ($script:MadeStore -and $script:Store -and (Test-Path -LiteralPath $script:Store)) { Remove-Item -LiteralPath $script:Store -Recurse -Force }
+    if ($script:MadeHf -and (Test-Path -LiteralPath $script:HfSource)) { Remove-Item -LiteralPath $script:HfSource -Recurse -Force }
     if ($script:LogDir -and (Test-Path -LiteralPath $script:LogDir)) { Remove-Item -LiteralPath $script:LogDir -Recurse -Force }
+}
+
+Describe 'Test environment' {
+    It 'has a second fixed drive on CI, so the action tests below really run' {
+        if ($env:CI) { $script:Dest | Should -Not -BeNullOrEmpty }
+    }
 }
 
 Describe 'Get-TriageRedirectPlan' -Skip:$script:NoOtherDrive {
@@ -70,15 +90,30 @@ Describe 'Set-TriageRedirect refuses anything outside its narrow job' -Skip:$scr
         { Set-TriageRedirect -Item ([pscustomobject]@{ Variable = 'PATH'; ProposedValue = "$($script:Dest):\FromC\Users\x\y" }) -LogDirectory $script:LogDir } | Should -Throw '*Not a variable*'
         { Set-TriageRedirect -Item ([pscustomobject]@{ Variable = 'triton_cache_dir'; ProposedValue = $script:Value }) -LogDirectory $script:LogDir } | Should -Throw '*Not a variable*'
     }
-    It 'refuses a folder outside FromC' {
-        { Set-TriageRedirect -Item ([pscustomobject]@{ Variable = $script:Var; ProposedValue = "$($script:Dest):\Windows\.triton\cache" }) -LogDirectory $script:LogDir } | Should -Throw '*FromC*'
-        { Set-TriageRedirect -Item ([pscustomobject]@{ Variable = $script:Var; ProposedValue = '\\server\share\FromC\Users\x\.triton\cache' }) -LogDirectory $script:LogDir } | Should -Throw '*FromC*'
+    It 'refuses any folder other than the one expected folder for that store' {
+        foreach ($bad in @(
+            "$($script:Dest):\Windows\.triton\cache",
+            '\\server\share\FromC\Users\x\.triton\cache',
+            "$($script:Dest):\FromC\Users\someone-else\.triton\cache",
+            "$($script:Dest):\FromC\Users\x\..\..\..\.triton\cache",
+            ($script:Value + '\deeper'),
+            ($script:Value + '.'),
+            ($script:Value.Replace('.triton\cache', '.cache\huggingface'))
+        )) {
+            { Set-TriageRedirect -Item ([pscustomobject]@{ Variable = $script:Var; ProposedValue = $bad }) -LogDirectory $script:LogDir } | Should -Throw '*Refused*' -Because $bad
+        }
     }
-    It 'refuses path tricks' {
-        { Set-TriageRedirect -Item ([pscustomobject]@{ Variable = $script:Var; ProposedValue = "$($script:Dest):\FromC\Users\x\..\..\..\.triton\cache" }) -LogDirectory $script:LogDir } | Should -Throw '*Refused*'
+    It 'refuses the drive that holds Windows and the user profile' {
+        $onSystem = 'C' + $script:Value.Substring(1)
+        { Set-TriageRedirect -Item ([pscustomobject]@{ Variable = $script:Var; ProposedValue = $onSystem }) -LogDirectory $script:LogDir } | Should -Throw '*Refused*'
     }
-    It 'refuses a folder that belongs to a different store' {
-        { Set-TriageRedirect -Item ([pscustomobject]@{ Variable = $script:Var; ProposedValue = "$($script:Dest):\FromC\Users\x\.cache\huggingface" }) -LogDirectory $script:LogDir } | Should -Throw '*does not match*'
+    It 'refuses a new folder that already has something in it' {
+        if (-not $script:MadeStore) { Set-ItResult -Skipped -Because 'the store folder existed before the test'; return }
+        New-Item -ItemType Directory -Path $script:Value -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $script:Value 'planted.txt') -Value 'x'
+        try {
+            { Set-TriageRedirect -Item ([pscustomobject]@{ Variable = $script:Var; ProposedValue = $script:Value }) -LogDirectory $script:LogDir } | Should -Throw '*not empty*'
+        } finally { Remove-Item -LiteralPath (Join-Path $script:Value 'planted.txt') -Force }
     }
     It 'left the variable unset after all those refusals' {
         [Environment]::GetEnvironmentVariable($script:Var, 'User') | Should -BeNullOrEmpty
@@ -96,6 +131,10 @@ Describe 'Set and undo' -Skip:$script:NoOtherDrive {
     }
     It 'does not touch the machine-level variable' {
         [Environment]::GetEnvironmentVariable($script:Var, 'Machine') | Should -BeNullOrEmpty
+    }
+    It 'gives an undo record that names exactly what was set' {
+        $script:Record.NewValue | Should -Be $script:Value
+        $script:Record.Variable | Should -Be $script:Var
     }
     It 'refuses to overwrite a variable that is already set' {
         { Set-TriageRedirect -Item ([pscustomobject]@{ Variable = $script:Var; ProposedValue = $script:Value }) -LogDirectory $script:LogDir } | Should -Throw '*already set*'

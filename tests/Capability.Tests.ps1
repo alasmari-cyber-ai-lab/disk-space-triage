@@ -75,14 +75,14 @@ BeforeAll {
 
     # Static members allowed on the types that could otherwise read, write or reach out.
     $script:AllowedStaticMembers = @{
-        'System.IO.File'                    = @('Create', 'OpenRead', 'Delete', 'SetLastWriteTimeUtc')
+        'System.IO.File'                    = @('Create', 'OpenRead', 'Delete', 'SetLastWriteTimeUtc', 'Move')
         'System.Security.Cryptography.SHA256' = @('Create')
         'System.BitConverter'               = @('ToString')
         'Microsoft.VisualBasic.FileIO.FileSystem' = @('DeleteDirectory', 'DeleteFile')
         'System.IO.Path'                    = @('GetFullPath', 'GetDirectoryName', 'GetFileName')
         'scriptblock'                       = @()
         'System.Globalization.CultureInfo'  = @('InvariantCulture')
-        'Environment'                       = @('GetFolderPath', 'GetEnvironmentVariable', 'SetEnvironmentVariable')
+        'Environment'                       = @('GetFolderPath', 'GetEnvironmentVariable', 'SetEnvironmentVariable', 'UserInteractive')
         'System.Windows.Markup.XamlReader'  = @('Parse')
         'System.Windows.Clipboard'          = @('SetText')
         'System.Windows.MessageBox'         = @('Show')
@@ -280,11 +280,18 @@ Describe '.NET surface' {
         $delete = Get-Calls 'System.IO.File' 'Delete'
         $delete.Count | Should -Be 1
         Get-EnclosingFunction -Node $delete[0] | Should -Be 'Move-TriageFile'
-        $delete[0].Arguments[0].Extent.Text    | Should -Be '$destination'
+        $delete[0].Arguments[0].Extent.Text    | Should -Be '$partial' -Because 'only the temporary copy may ever be deleted'
 
         $stamp = Get-Calls 'System.IO.File' 'SetLastWriteTimeUtc'
         $stamp.Count | Should -Be 1
-        $stamp[0].Arguments[0].Extent.Text | Should -Be '$destination'
+        $stamp[0].Arguments[0].Extent.Text | Should -Be '$partial'
+
+        # The temporary copy gets its real name in one place, and only that way round
+        $rename = @(Get-Calls 'System.IO.File' 'Move')
+        $rename.Count | Should -Be 1
+        Get-EnclosingFunction -Node $rename[0] | Should -Be 'Move-TriageFile'
+        $rename[0].Arguments[0].Extent.Text | Should -Be '$partial'
+        $rename[0].Arguments[1].Extent.Text | Should -Be '$destination'
 
         # Recycle Bin only, never a permanent delete
         $recycleDir = Get-Calls 'Microsoft.VisualBasic.FileIO.FileSystem' 'DeleteDirectory'
@@ -296,7 +303,26 @@ Describe '.NET surface' {
         $recycleFile[0].Arguments[0].Extent.Text    | Should -Be '$source'
         foreach ($call in (@($recycleDir) + @($recycleFile))) {
             $call.Arguments.Count          | Should -Be 4
+            $call.Arguments[1].Extent.Text | Should -Be '[Microsoft.VisualBasic.FileIO.UIOption]::AllDialogs' -Because 'the silent mode deletes permanently without asking when an item cannot be recycled'
             $call.Arguments[2].Extent.Text | Should -Be '[Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin'
+        }
+    }
+
+    It 'refuses both actions without an interactive desktop' {
+        foreach ($name in @('Remove-TriageStore', 'Move-TriageFile')) {
+            $fn = $script:Ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
+            $fn.Body.Extent.Text | Should -Match 'if \(-not \(Test-TriageInteractive\)\) \{ throw'
+        }
+    }
+
+    It 'has exactly these removable stores, movable folders and cache folder names' {
+        . $script:ScriptPath -ImportOnly
+        (@($script:TriageRecyclableNotes.Keys | Sort-Object) -join '|') | Should -Be 'Browser cache|Crash dumps|DirectX shader cache|Discord cache|GPU shader cache|node_modules; needs a package-lock file to rebuild, never copy|Rust build output, if this is a Cargo project|Slack cache|Steam shader cache|Teams (classic) cache'
+        (@($script:TriageMovableNotes.Keys | Sort-Object) -join '|')    | Should -Be '3D Objects|Documents|Downloads|Music|Pictures|Videos'
+        (@($script:TriageCacheFolderNames.Keys | Sort-Object) -join '|') | Should -Be 'cache|code cache|dawncache|dawngraphitecache|dawnwebgpucache|gpucache|graphitedawncache|grshadercache|shadercache'
+        # Each removable description belongs to Delete-bucket rules only.
+        foreach ($rule in $script:TriageRules) {
+            if ($script:TriageRecyclableNotes.ContainsKey($rule.Note)) { $rule.Bucket | Should -Be 'Delete' }
         }
     }
 
@@ -304,7 +330,7 @@ Describe '.NET surface' {
         $streams = @($script:Commands | Where-Object { $_.GetCommandName() -eq 'New-Object' -and $_.Extent.Text -match 'System\.IO\.FileStream' })
         $streams.Count | Should -Be 1
         Get-EnclosingFunction -Node $streams[0] | Should -Be 'Move-TriageFile'
-        $streams[0].Extent.Text | Should -Match '^New-Object System\.IO\.FileStream\(\$destination, \[System\.IO\.FileMode\]::CreateNew, '
+        $streams[0].Extent.Text | Should -Match '^New-Object System\.IO\.FileStream\(\$partial, \[System\.IO\.FileMode\]::CreateNew, '
         @($script:Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.MemberExpressionAst] -and $n.Static -and
             $n.Expression.Extent.Text -eq '[System.IO.FileMode]' }, $true) | ForEach-Object { $_.Member.Extent.Text } | Sort-Object -Unique) | Should -Be @('CreateNew')
     }

@@ -314,7 +314,6 @@ $script:TriageRecyclableNotes = @{
     'node_modules; needs a package-lock file to rebuild, never copy' = 'NodeModules'
     'Rust build output, if this is a Cargo project'                  = 'RustTarget'
     'Steam shader cache'          = 'Cache'
-    'Interrupted Steam downloads' = 'Cache'
     'GPU shader cache'            = 'Cache'
     'DirectX shader cache'        = 'Cache'
     'Crash dumps'                 = 'Cache'
@@ -323,6 +322,26 @@ $script:TriageRecyclableNotes = @{
     'Teams (classic) cache'       = 'AppCache'
     'Browser cache'               = 'AppCache'
 }
+
+# Folder names that really are caches. An application "cache" store is only
+# removable when its top folder has one of these names.
+$script:TriageCacheFolderNames = @{
+    'cache' = $true; 'code cache' = $true; 'gpucache' = $true; 'shadercache' = $true; 'grshadercache' = $true
+    'dawncache' = $true; 'dawngraphitecache' = $true; 'dawnwebgpucache' = $true; 'graphitedawncache' = $true
+}
+
+# File types that are somebody's work or data. One of these inside a
+# "rebuildable" folder means the folder is not purely rebuildable.
+$script:TriagePersonalExtensions = @{}
+foreach ($ext in @('.docx', '.doc', '.xlsx', '.xls', '.pptx', '.ppt', '.odt', '.psd', '.psb', '.ai', '.indd', '.aep', '.prproj', '.drp', '.blend',
+                   '.safetensors', '.ckpt', '.pt', '.pth', '.gguf', '.parquet', '.feather', '.arrow', '.h5', '.hdf5', '.npz', '.npy', '.mat',
+                   '.pst', '.ost', '.bak', '.vbk', '.bacpac', '.iso', '.img', '.vhdx', '.vhd', '.vmdk', '.vdi', '.qcow2',
+                   '.mkv', '.mov', '.avi', '.raw', '.cr2', '.cr3', '.nef', '.arw', '.dng', '.kdbx', '.sqlite', '.db', '.mdf')) {
+    $script:TriagePersonalExtensions[$ext] = $true
+}
+
+# Types the Move action never touches, even in a known folder.
+$script:TriageNeverMoveExtensions = @{ '.pst' = $true; '.ost' = $true }
 
 # Move-bucket rules whose files the tool may move itself: plain user files in
 # the known folders. (Files matched only by the file-type fallback are also
@@ -599,6 +618,7 @@ function Invoke-TriageWalk {
                 $store = [pscustomobject]@{
                     Path = $dir.FullName; Match = $dirClass.Match; Note = $dirClass.Note
                     TotalBytes = [long]0; Files = [long]0; Mixed = $false; Incomplete = $false; HasLink = $false
+                    Personal = ''; LongPath = $false
                 }
                 $State.Stores[$dir.FullName] = $store
             }
@@ -645,6 +665,11 @@ function Invoke-TriageWalk {
                     }
                     $dirBytes += $length
                     $dirFiles++
+                    if ($null -ne $store) {
+                        # A personal file type inside a rebuildable store means it is not purely rebuildable.
+                        if ($store.Personal -eq '' -and $script:TriagePersonalExtensions.ContainsKey($file.Extension.ToLowerInvariant())) { $store.Personal = $file.FullName }
+                        if ($file.FullName.Length -ge 248) { $store.LongPath = $true }
+                    }
                 }
                 catch { $State.DeniedCount++ }
             }
@@ -868,9 +893,9 @@ function Get-SampleTriageResult {
         )
         Files             = $files
         DeleteCandidates  = @(
-            [pscustomobject]@{ Path = 'C:\src\webapp\node_modules'; Match = '*\node_modules\*'; Note = 'node_modules; needs a package-lock file to rebuild, never copy'; TotalBytes = [long](9.4 * $gb); Files = [long]412044; Mixed = $false; Incomplete = $false; HasLink = $false }
-            [pscustomobject]@{ Path = "$profilePath\AppData\Local\D3DSCache"; Match = '*\AppData\Local\D3DSCache\*'; Note = 'DirectX shader cache'; TotalBytes = [long](2.2 * $gb); Files = [long]6120; Mixed = $false; Incomplete = $false; HasLink = $false }
-            [pscustomobject]@{ Path = "$profilePath\AppData\Local\CrashDumps"; Match = '*\AppData\Local\CrashDumps\*'; Note = 'Crash dumps'; TotalBytes = [long](1.1 * $gb); Files = [long]14; Mixed = $false; Incomplete = $false; HasLink = $false }
+            [pscustomobject]@{ Path = 'C:\src\webapp\node_modules'; Match = '*\node_modules\*'; Note = 'node_modules; needs a package-lock file to rebuild, never copy'; TotalBytes = [long](9.4 * $gb); Files = [long]412044; Mixed = $false; Incomplete = $false; HasLink = $false; Personal = ''; LongPath = $false }
+            [pscustomobject]@{ Path = "$profilePath\AppData\Local\D3DSCache"; Match = '*\AppData\Local\D3DSCache\*'; Note = 'DirectX shader cache'; TotalBytes = [long](2.2 * $gb); Files = [long]6120; Mixed = $false; Incomplete = $false; HasLink = $false; Personal = ''; LongPath = $false }
+            [pscustomobject]@{ Path = "$profilePath\AppData\Local\CrashDumps"; Match = '*\AppData\Local\CrashDumps\*'; Note = 'Crash dumps'; TotalBytes = [long](1.1 * $gb); Files = [long]14; Mixed = $false; Incomplete = $false; HasLink = $false; Personal = ''; LongPath = $false }
         )
         ElevatedChecklist = @($script:TriageElevatedChecklist)
     }
@@ -1016,12 +1041,11 @@ function Export-TriageReport {
 }
 
 #region Actions --------------------------------------------------------------
-# The ONLY changes this tool can make to a machine, and only after the user
-# enables actions and confirms each one:
+# Redirect: after the user enables it and confirms each change, the tool can
 #   1. create an empty folder on the destination drive, and
 #   2. set (or restore) a user-level environment variable from the list below.
-# Nothing is moved or deleted. The old folder stays where it is until the user
-# removes it. Every change is written to an action log so it can be undone.
+# Redirect moves and deletes nothing: the old folder stays where it is until
+# the user deals with it. Every change is written to the action log.
 
 function New-TriageRedirectTarget {
     param([string]$Variable, [string]$Mechanism, [string]$RelativePath, [string]$Effect, [string]$OldFolder)
@@ -1178,7 +1202,10 @@ function Write-TriageActionLog {
     param([Parameter(Mandatory)] $Record, [string]$Directory)
     $target = Resolve-ReportDirectory -Requested $Directory
     $path   = Join-Path $target 'DiskTriage_actions.csv'
-    $Record | Select-Object When, Action, Variable, OldValue, NewValue | Export-Csv -LiteralPath $path -NoTypeInformation -Encoding UTF8 -Append
+    $detail = ''
+    if ($Record.PSObject.Properties.Name -contains 'Detail') { $detail = [string]$Record.Detail }
+    [pscustomobject]@{ When = $Record.When; Action = $Record.Action; Variable = $Record.Variable; OldValue = $Record.OldValue; NewValue = $Record.NewValue; Detail = $detail } |
+        Export-Csv -LiteralPath $path -NoTypeInformation -Encoding UTF8 -Append -Force
     return $path
 }
 
@@ -1263,13 +1290,16 @@ function Undo-TriageRedirect {
 
 #region Delete and Move ------------------------------------------------------
 # Two further actions, each off until the user enables it and confirms:
-#   Delete - send one whole store folder (from a short list of rebuildable
-#            stores) to the Recycle Bin.
-#   Move   - copy one plain data file to <drive>:\FromC\<same path>, verify
-#            the copy byte for byte by SHA-256, then send the original to the
-#            Recycle Bin.
-# Nothing is ever deleted permanently by this script, and nothing is
-# overwritten.
+#   Delete - ask Windows to put ONE whole store folder (from a short list of
+#            rebuildable stores) in the Recycle Bin.
+#   Move   - copy ONE plain data file to <drive>:\FromC\<same path> under a
+#            temporary name, re-read and compare it by SHA-256, give it its
+#            final name, then ask Windows to put the original in the Recycle
+#            Bin.
+# The script itself never deletes anything permanently except its own
+# unverified temporary copy, and never overwrites. Whether an item lands in
+# the Recycle Bin is finally up to Windows; items Windows could not recycle
+# (too large, paths too long) are refused up front instead.
 
 function Initialize-TriageRecycleBin {
     # The Recycle Bin is reached through the Visual Basic runtime that ships
@@ -1277,41 +1307,98 @@ function Initialize-TriageRecycleBin {
     Add-Type -AssemblyName Microsoft.VisualBasic
 }
 
+function Test-TriageInteractive {
+    # Without an interactive desktop Windows cannot use the Recycle Bin and
+    # would delete permanently, so both actions refuse to run.
+    return [bool][Environment]::UserInteractive
+}
+
+function Get-TriageRecycleLimit {
+    # A conservative estimate of the largest item the Recycle Bin of a drive
+    # accepts: half of the Windows default quota.
+    param([string]$Letter)
+    $facts = Get-DriveFacts -Letter $Letter
+    if ($null -eq $facts) { return [long]0 }
+    $total = [double]$facts.TotalBytes
+    $quota = $total * 0.10
+    if ($total -gt 40GB) { $quota = 4GB + 0.05 * ($total - 40GB) }
+    return [long]($quota / 2)
+}
+
+function Test-TriageProtectedLocation {
+    <#
+        Returns '' or the reason a path may not be removed or moved by the
+        tool because of WHERE it is: installed software, application data,
+        and cloud-sync folders.
+    #>
+    param([string]$Path)
+    if ($Path -match '~[0-9]') { return 'The path contains a short (8.3) name.' }
+    if ($Path -match '^[A-Za-z]:\\(Windows|Program Files|Program Files \(x86\)|ProgramData)\\') { return 'It is inside installed software or system data.' }
+    if ($Path -match '^[A-Za-z]:\\Users\\[^\\]+\\(OneDrive[^\\]*|Dropbox|iCloudDrive|iCloud Drive|My Drive|Google Drive|Box|Box Sync|MEGA|pCloud[^\\]*|Sync)\\') { return 'It is inside a cloud-sync folder; change it through the sync client.' }
+    if ($Path -match '\\(iCloud Photos|SharePoint|scoop|chocolatey)\\') { return 'It is inside a sync or package-manager folder.' }
+    return ''
+}
+
 function Get-TriageDeletePlan {
     <#
         Read-only. Lists the store folders the scan found that the tool may
-        send to the Recycle Bin, and why any of them is not offered.
+        ask Windows to recycle, and why any of them is not offered.
     #>
     param([Parameter(Mandatory)] $Result)
 
     $plan = foreach ($c in @($Result.DeleteCandidates)) {
         $state = 'Ready'; $reason = ''
-        $kind  = [string]$script:TriageRecyclableNotes[[string]$c.Note]
-        $parent = [System.IO.Path]::GetDirectoryName([string]$c.Path)
+        $path   = [string]$c.Path
+        $kind   = [string]$script:TriageRecyclableNotes[[string]$c.Note]
+        $parent = [System.IO.Path]::GetDirectoryName($path)
+        $leaf   = [System.IO.Path]::GetFileName($path).ToLowerInvariant()
+        $where  = Test-TriageProtectedLocation -Path $path
 
-        if ($c.Mixed) {
-            $state = 'Blocked'; $reason = 'It contains files that belong to something else.'
+        if ($kind -eq '') {
+            $state = 'Blocked'; $reason = 'It is not one of the stores the tool may remove.'
+        } elseif ($where -ne '') {
+            $state = 'Blocked'; $reason = $where
+        } elseif ($c.Mixed) {
+            $state = 'Blocked'; $reason = 'It contains another store or a virtual disk.'
+        } elseif ([string]$c.Personal -ne '') {
+            $state = 'Blocked'; $reason = "It contains what looks like your own work: $([System.IO.Path]::GetFileName([string]$c.Personal))"
         } elseif ($c.HasLink) {
             $state = 'Blocked'; $reason = 'It contains a junction or symbolic link.'
         } elseif ($c.Incomplete) {
             $state = 'Blocked'; $reason = 'Part of it could not be read, so its contents are not fully known.'
-        } elseif ($kind -eq 'NodeModules') {
-            $lock = $false
-            foreach ($name in @('package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'npm-shrinkwrap.json', 'bun.lockb')) {
-                if (Test-Path -LiteralPath (Join-Path $parent $name) -PathType Leaf) { $lock = $true }
-            }
-            if (-not $lock) { $state = 'Blocked'; $reason = 'No lockfile next to it, so it could not be rebuilt exactly.' }
-        } elseif ($kind -eq 'RustTarget') {
-            $project = [System.IO.Path]::GetDirectoryName($parent)
-            if ([string]::IsNullOrEmpty($project) -or -not (Test-Path -LiteralPath (Join-Path $project 'Cargo.toml') -PathType Leaf)) {
-                $state = 'Blocked'; $reason = 'No Cargo.toml beside the target folder, so this may not be Rust build output.'
+        } elseif ($c.LongPath) {
+            $state = 'Blocked'; $reason = 'It has paths too long for the Recycle Bin; Windows would delete it permanently. Remove it yourself if you are sure.'
+        } elseif ([long]$c.TotalBytes -gt (Get-TriageRecycleLimit -Letter $path.Substring(0, 1))) {
+            $state = 'Blocked'; $reason = 'It is too large for the Recycle Bin; Windows would delete it permanently. Remove it yourself if you are sure.'
+        } elseif ($kind -eq 'NodeModules' -or $kind -eq 'RustTarget') {
+            if ($path -match '\\AppData\\' -or $path -match '\\\.[^\\]+\\') {
+                $state = 'Blocked'; $reason = 'It belongs to an application or a tool, not to one of your projects.'
+            } elseif ($kind -eq 'NodeModules') {
+                $lock = $false
+                foreach ($name in @('package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'npm-shrinkwrap.json', 'bun.lockb')) {
+                    if (Test-Path -LiteralPath (Join-Path $parent $name) -PathType Leaf) { $lock = $true }
+                }
+                if (-not $lock -or -not (Test-Path -LiteralPath (Join-Path $parent 'package.json') -PathType Leaf)) {
+                    $state = 'Blocked'; $reason = 'No package.json and lockfile next to it, so it could not be rebuilt exactly.'
+                } else {
+                    $reason = 'rebuild later with npm ci (or your package manager)'
+                }
+            } else {
+                $project = [System.IO.Path]::GetDirectoryName($parent)
+                if ([string]::IsNullOrEmpty($project) -or -not (Test-Path -LiteralPath (Join-Path $project 'Cargo.toml') -PathType Leaf)) {
+                    $state = 'Blocked'; $reason = 'No Cargo.toml beside the target folder, so this may not be Rust build output.'
+                }
             }
         } elseif ($kind -eq 'AppCache') {
-            $reason = 'close the application first'
+            if (-not $script:TriageCacheFolderNames.ContainsKey($leaf)) {
+                $state = 'Blocked'; $reason = 'Its name contains "cache" but it is not a plain cache folder; it may hold site or app data.'
+            } else {
+                $reason = 'close the application first'
+            }
         }
 
         [pscustomobject]@{
-            Path      = [string]$c.Path
+            Path      = $path
             Note      = [string]$c.Note
             SizeBytes = [long]$c.TotalBytes
             Files     = [long]$c.Files
@@ -1324,13 +1411,14 @@ function Get-TriageDeletePlan {
 
 function Remove-TriageStore {
     <#
-        Sends ONE store folder to the Recycle Bin. Everything is re-checked
-        here, so a stale or edited plan item cannot widen what is removed:
-        the folder itself must classify as a recyclable store, its parent must
-        not (it is the top of the store), and it must be a real folder on a
-        local fixed disk with no link above it.
+        Asks Windows to put ONE store folder in the Recycle Bin. Everything is
+        re-checked here against the disk as it is now, so a stale or edited
+        plan item cannot widen what is removed. Returns a record whose
+        StillExists field says whether the folder is really gone.
     #>
-    param([Parameter(Mandatory)] $Item, [string]$LogDirectory, [switch]$ShowDialogs)
+    param([Parameter(Mandatory)] $Item, [string]$LogDirectory)
+
+    if (-not (Test-TriageInteractive)) { throw 'Refused: there is no interactive desktop, so Windows could not use the Recycle Bin.' }
 
     $path = [string]$Item.Path
     if ($path -notmatch '^[A-Za-z]:\\[^\\]+\\[^\\]+') { throw "Refused: not a folder at least two levels below a drive root: $path" }
@@ -1350,36 +1438,43 @@ function Remove-TriageStore {
     $parentClass = Get-TriageClassification -Path ([System.IO.Path]::GetDirectoryName($path) + '\')
     if ([object]::ReferenceEquals($parentClass, $class)) { throw "Refused: this is a folder inside a store, not the store itself: $path" }
 
-    # The same conditions the plan applies, checked against the disk as it is now.
-    $check = @(Get-TriageDeletePlan -Result ([pscustomobject]@{ DeleteCandidates = @(
-        [pscustomobject]@{ Path = $path; Note = $class.Note; TotalBytes = [long]0; Files = [long]0; Mixed = $false; Incomplete = $false; HasLink = $false }) }))
-    if ($check[0].State -ne 'Ready') { throw "Refused: $($check[0].Reason)" }
-
-    # Look at the folder as it is now, not as it was when it was scanned: it
-    # must still be one store with nothing foreign, linked or unreadable in it.
+    # Walk the folder as it is now and apply exactly the plan's conditions to
+    # what is found: one store, nothing foreign, personal, linked, unreadable,
+    # too long or too large.
     $state = New-TriageScanState
     $script:TriageCancel = $false
     Invoke-TriageWalk -Root $path -MaxDepth 64 -MinBytes 1MB -State $state -OnProgress $null
     $now = $state.Stores[$path]
-    if ($null -eq $now) { throw "Refused: the folder could not be examined: $path" }
-    if ($state.Stores.Count -ne 1 -or $now.Mixed) { throw "Refused: the folder contains files that belong to something else: $path" }
-    if ($now.HasLink)    { throw "Refused: the folder contains a junction or symbolic link: $path" }
-    if ($now.Incomplete -or $state.DeniedCount -gt 0 -or $state.DepthLimited -gt 0) { throw "Refused: part of the folder could not be read: $path" }
+    if ($state.Cancelled -or $null -eq $now) { throw "Refused: the folder could not be examined: $path" }
+    if ($state.Stores.Count -ne 1) { $now.Mixed = $true }
+    if ($state.DeniedCount -gt 0 -or $state.DepthLimited -gt 0) { $now.Incomplete = $true }
+    $check = @(Get-TriageDeletePlan -Result ([pscustomobject]@{ DeleteCandidates = @($now) }))
+    if ($check[0].State -ne 'Ready') { throw "Refused: $($check[0].Reason)" }
 
     $logTarget = Resolve-ReportDirectory -Requested $LogDirectory
     Initialize-TriageRecycleBin
 
-    $ui = [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs
-    if ($ShowDialogs) { $ui = [Microsoft.VisualBasic.FileIO.UIOption]::AllDialogs }
-    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($path, $ui, [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin, [Microsoft.VisualBasic.FileIO.UICancelOption]::ThrowException)
+    $failure = ''
+    try {
+        [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($path, [Microsoft.VisualBasic.FileIO.UIOption]::AllDialogs, [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin, [Microsoft.VisualBasic.FileIO.UICancelOption]::ThrowException)
+    } catch { $failure = $_.Exception.Message }
 
+    # Report what is true on the disk, not what was asked for.
+    $still = Test-Path -LiteralPath $path
+    if ($still -and (Test-TriageFolderEmpty -Path $path) -eq $false -and $failure -eq '') { $failure = 'Windows did not remove everything (files in use?).' }
+    if ($still -and $failure -eq '') { $failure = 'The folder is still there.' }
+
+    $action = 'Recycle'
+    if ($still) { $action = 'Recycle (not completed)' }
     $record = [pscustomobject]@{
-        When     = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture)
-        Action   = 'Recycle'
-        Variable = ''
-        OldValue = $path
-        NewValue = 'Recycle Bin'
-        LogPath  = ''
+        When        = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture)
+        Action      = $action
+        Variable    = ''
+        OldValue    = $path
+        NewValue    = 'Recycle Bin'
+        Detail      = $failure
+        LogPath     = ''
+        StillExists = [bool]$still
     }
     try { $record.LogPath = Write-TriageActionLog -Record $record -Directory $logTarget } catch { $record.LogPath = '' }
     return $record
@@ -1392,13 +1487,46 @@ function Get-TriageMoveTarget {
 }
 
 function Test-TriageMovableFile {
-    # Returns '' when the tool may move this file, otherwise the reason not.
+    <#
+        Returns '' when the tool may move this file, otherwise the reason not.
+        Judged from the path alone: a plain data file of a known type, outside
+        installed software, application data, hidden tool folders and
+        cloud-sync folders.
+    #>
     param([string]$Path)
     Initialize-TriageRules
+
+    $where = Test-TriageProtectedLocation -Path $Path
+    if ($where -ne '') { return $where }
+    if ($Path -match '\\AppData\\')      { return 'It is application data; move it with the owning application.' }
+    if ($Path -match '\\\.[^\\]+\\' -or [System.IO.Path]::GetFileName($Path).StartsWith('.')) { return 'It is inside a hidden tool folder (for example .git).' }
+
+    $leafStart = $Path.LastIndexOf('\') + 1
+    $dot       = $Path.LastIndexOf('.')
+    $extension = ''
+    if ($dot -gt $leafStart) { $extension = $Path.Substring($dot).ToLowerInvariant() }
+    if (-not $script:TriageExtensionSet.ContainsKey($extension)) { return 'It is not a plain data file type the tool recognises.' }
+    if ($script:TriageNeverMoveExtensions.ContainsKey($extension)) { return 'Mail stores must be moved from within Outlook.' }
+
     $class = Get-TriageClassification -Path $Path
     if ([object]::ReferenceEquals($class, $script:TriageFallbackMove)) { return '' }
     if ($class.Bucket -eq 'Move' -and $script:TriageMovableNotes.ContainsKey([string]$class.Note)) { return '' }
     return 'This file belongs to a program or store; move it with the owning application.'
+}
+
+function Test-TriageReparseAbove {
+    # True when any existing folder above the path carries a reparse point of
+    # ANY kind. Stricter than the link test: it also catches cloud-sync trees.
+    param([string]$Path)
+    $probe = [System.IO.Path]::GetDirectoryName($Path)
+    while (-not [string]::IsNullOrEmpty($probe) -and $probe.Length -gt 3) {
+        if (Test-Path -LiteralPath $probe) {
+            $info = New-Object System.IO.DirectoryInfo $probe
+            if ($info.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { return $true }
+        }
+        $probe = [System.IO.Path]::GetDirectoryName($probe)
+    }
+    return $false
 }
 
 function Get-TriageMovePlan {
@@ -1430,12 +1558,18 @@ function Get-TriageMovePlan {
             $target = Get-TriageMoveTarget -Source $path -Letter $letter
             if ($letter.ToUpper() -eq $path.Substring(0, 1).ToUpper()) {
                 $state = 'Blocked'; $reason = 'The destination is the drive the file is already on.'
-            } elseif ($target.Length -gt 240) {
+            } elseif ($target.Length -gt 230) {
                 $state = 'Blocked'; $reason = 'The new path would be too long for Windows.'
             } elseif ($free -lt ([long]$f.SizeBytes + 1GB)) {
                 $state = 'Blocked'; $reason = 'Not enough free space on the destination.'
             } elseif (Test-Path -LiteralPath $target) {
                 $state = 'Blocked'; $reason = 'A file with this name is already there. Check it first.'
+            } elseif (Test-Path -LiteralPath ($target + '.triage-partial')) {
+                $state = 'Blocked'; $reason = 'An earlier move of this file was interrupted. Delete the leftover .triage-partial file on the destination, then scan again.'
+            } elseif (Test-TriageReparseAbove -Path $path) {
+                $state = 'Blocked'; $reason = 'It is inside a linked or cloud-synced folder.'
+            } elseif ([long]$f.SizeBytes -gt (Get-TriageRecycleLimit -Letter $path.Substring(0, 1))) {
+                $reason = 'too large for the Recycle Bin: after the verified copy, Windows will ask before removing the original'
             }
         }
 
@@ -1481,13 +1615,17 @@ function Get-TriageFileHash {
 
 function Move-TriageFile {
     <#
-        Moves ONE plain data file: copy to <drive>:\FromC\<same path>, verify
-        the copy by SHA-256, keep the original's timestamp, then send the
-        original to the Recycle Bin. Never overwrites. If anything fails or
-        the user cancels before the copy is verified, the partial copy is
-        removed and the original is untouched.
+        Moves ONE plain data file. The copy is written under a temporary name
+        (<target>.triage-partial), re-read and compared with the original by
+        SHA-256, and only then given its final name. The original is held
+        open, so nothing can change it, until the comparison is done; then
+        Windows is asked to put it in the Recycle Bin. Never overwrites. If
+        anything fails or the user cancels, the temporary copy is removed and
+        the original is untouched.
     #>
-    param([Parameter(Mandatory)] $Item, [string]$LogDirectory, [scriptblock]$OnProgress, [switch]$ShowDialogs)
+    param([Parameter(Mandatory)] $Item, [string]$LogDirectory, [scriptblock]$OnProgress)
+
+    if (-not (Test-TriageInteractive)) { throw 'Refused: there is no interactive desktop, so Windows could not use the Recycle Bin.' }
 
     $source = [string]$Item.Path
     if ($source -notmatch '^[A-Za-z]:\\') { throw "Refused: not a full local path: $source" }
@@ -1508,13 +1646,17 @@ function Move-TriageFile {
     if ($driveProblem -ne '') { throw "Refused: $driveProblem" }
 
     $info = Get-Item -LiteralPath $source -Force
-    if (([int]$info.Attributes -band 0x401400) -ne 0) { throw 'Refused: the file is a link or a cloud-only placeholder.' }
-    if (Test-TriageLinkInPath -Path ([System.IO.Path]::GetDirectoryName($source))) { throw 'Refused: the file is below a junction or symbolic link.' }
+    # ReparsePoint, Offline, Recall (cloud placeholders), Pinned / Unpinned
+    # (cloud-synced), Encrypted, Hidden, System.
+    if (([int]$info.Attributes -band 0x5C5406) -ne 0) { throw 'Refused: the file is a link, cloud-synced, encrypted, hidden or a system file.' }
+    if (Test-TriageReparseAbove -Path $source) { throw 'Refused: the file is inside a linked or cloud-synced folder.' }
     $size = [long]$info.Length
 
     $facts = Get-DriveFacts -Letter $letter
     if ($facts.FreeBytes -lt ($size + 1GB)) { throw 'Refused: not enough free space on the destination.' }
+    $partial = $destination + '.triage-partial'
     if (Test-Path -LiteralPath $destination) { throw "Refused: something already exists at $destination. Nothing is ever overwritten." }
+    if (Test-Path -LiteralPath $partial)     { throw "Refused: a leftover from an interrupted move exists. Delete it first: $partial" }
 
     $folder = [System.IO.Path]::GetDirectoryName($destination)
     if (Test-TriageLinkInPath -Path $folder) { throw "Refused: the new place is below a junction or symbolic link: $folder" }
@@ -1524,68 +1666,78 @@ function Move-TriageFile {
     if (-not (Test-Path -LiteralPath $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
 
     $script:TriageCancel = $false
-    $created  = $false
-    $verified = $false
+    $created    = $false
+    $finished   = $false
+    $sourceHash = ''
+    # The original stays open (readable, but not writable by anyone) from the
+    # first byte copied until the copy has been compared with it.
+    $in = [System.IO.File]::OpenRead($source)
     try {
-        # 1. Copy, hashing the source as it is read.
         $sha    = [System.Security.Cryptography.SHA256]::Create()
         $buffer = New-Object byte[] 4194304
         $done   = [long]0
-        $in     = [System.IO.File]::OpenRead($source)
+        $out    = New-Object System.IO.FileStream($partial, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $created = $true
         try {
-            $out = New-Object System.IO.FileStream($destination, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-            $created = $true
-            try {
-                while ($true) {
-                    $read = $in.Read($buffer, 0, $buffer.Length)
-                    if ($read -le 0) { break }
-                    $out.Write($buffer, 0, $read)
-                    [void]$sha.TransformBlock($buffer, 0, $read, $null, 0)
-                    $done += $read
-                    if ($null -ne $OnProgress) { & $OnProgress 'Copying' $done $size }
-                    if ($script:TriageCancel) { throw 'Cancelled. The original file was not touched.' }
-                }
-                $out.Flush($true)
+            while ($true) {
+                $read = $in.Read($buffer, 0, $buffer.Length)
+                if ($read -le 0) { break }
+                $out.Write($buffer, 0, $read)
+                [void]$sha.TransformBlock($buffer, 0, $read, $null, 0)
+                $done += $read
+                if ($null -ne $OnProgress) { & $OnProgress 'Copying' $done $size }
+                if ($script:TriageCancel) { throw 'Cancelled. The original file was not touched.' }
             }
-            finally { $out.Dispose() }
+            $out.Flush($true)
         }
-        finally { $in.Dispose() }
+        finally { $out.Dispose() }
         [void]$sha.TransformFinalBlock($buffer, 0, 0)
         $sourceHash = [System.BitConverter]::ToString($sha.Hash)
         $sha.Dispose()
 
-        # 2. Verify by reading the copy back from the destination disk.
-        if ($done -ne $size) { throw 'The file changed while it was being copied. The original was not touched.' }
-        $copyHash = Get-TriageFileHash -Path $destination -OnProgress $OnProgress -Stage 'Verifying'
+        if ($done -ne $size -or $in.Length -ne $size) { throw 'The file changed while it was being copied. The original was not touched.' }
+        $copyHash = Get-TriageFileHash -Path $partial -OnProgress $OnProgress -Stage 'Verifying'
         if ($null -eq $copyHash) { throw 'Cancelled. The original file was not touched.' }
         if ($copyHash -cne $sourceHash) { throw 'The copy does not match the original. The original was not touched.' }
-        [System.IO.File]::SetLastWriteTimeUtc($destination, $info.LastWriteTimeUtc)
-        $verified = $true
+
+        [System.IO.File]::SetLastWriteTimeUtc($partial, $info.LastWriteTimeUtc)
+        # Only a verified copy ever gets the real name. Move fails if the name is taken.
+        [System.IO.File]::Move($partial, $destination)
+        $finished = $true
     }
     finally {
-        # An unverified copy is never left behind.
-        if ($created -and -not $verified) { [System.IO.File]::Delete($destination) }
+        $in.Dispose()
+        if ($created -and -not $finished) {
+            # Never leave an unverified copy behind.
+            try { [System.IO.File]::Delete($partial) } catch { Write-Warning "Could not remove the temporary copy: $partial" }
+        }
     }
 
-    # 3. Only now does the original go to the Recycle Bin.
-    $recycled = $true
-    $ui = [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs
-    if ($ShowDialogs) { $ui = [Microsoft.VisualBasic.FileIO.UIOption]::AllDialogs }
-    try {
-        [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($source, $ui, [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin, [Microsoft.VisualBasic.FileIO.UICancelOption]::ThrowException)
-    } catch { $recycled = $false }
+    # The original must be exactly what was copied, or it stays.
+    $after = Get-Item -LiteralPath $source -Force
+    if ($after.Length -ne $size -or $after.LastWriteTimeUtc -ne $info.LastWriteTimeUtc) {
+        throw "The original changed after it was copied, so it was left in place. A verified copy of the earlier contents is at $destination."
+    }
 
+    $failure = ''
+    try {
+        [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($source, [Microsoft.VisualBasic.FileIO.UIOption]::AllDialogs, [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin, [Microsoft.VisualBasic.FileIO.UICancelOption]::ThrowException)
+    } catch { $failure = $_.Exception.Message }
+    $recycled = -not (Test-Path -LiteralPath $source)
+
+    $action = 'Move'
+    if (-not $recycled) { $action = 'Copy (original kept)' }
     $record = [pscustomobject]@{
         When     = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture)
-        Action   = 'Move'
+        Action   = $action
         Variable = ''
         OldValue = $source
         NewValue = $destination
+        Detail   = 'SHA256 ' + $sourceHash.Replace('-', '')
         LogPath  = ''
-        OriginalRecycled = $recycled
+        OriginalRecycled = [bool]$recycled
         Sha256   = $sourceHash.Replace('-', '')
     }
-    if (-not $recycled) { $record.Action = 'Copy (original kept)' }
     try { $record.LogPath = Write-TriageActionLog -Record $record -Directory $logTarget } catch { $record.LogPath = '' }
     return $record
 }
@@ -2525,7 +2677,7 @@ $script:TriageXaml = @'
           </Grid.RowDefinitions>
           <Border Grid.Row="0" Margin="12,12,12,10" Padding="14,8,14,8" Background="#FFF3D1" BorderBrush="#C8962B" BorderThickness="4,1,1,1" CornerRadius="6">
             <StackPanel>
-              <TextBlock TextWrapping="Wrap" FontSize="12.5" Foreground="{StaticResource InkBrush}" Text="These folders can be rebuilt or refill by themselves: package folders with a lockfile, shader and browser caches, crash dumps. The tool sends the whole folder to the Recycle Bin, so you can restore it. Space on the drive is freed when you empty the Recycle Bin. Close the application that owns a cache first."/>
+              <TextBlock TextWrapping="Wrap" FontSize="12.5" Foreground="{StaticResource InkBrush}" Text="These folders can be rebuilt or refill by themselves: package folders with a lockfile, shader and browser caches, crash dumps. The tool asks Windows to put the whole folder in the Recycle Bin, so you can restore it. Folders too large for the Recycle Bin are not offered. Space is freed when you empty the Recycle Bin. Close the application that owns a cache first."/>
               <CheckBox x:Name="EnableDeleteBox" Content="Allow this tool to send folders to the Recycle Bin" IsChecked="False" Margin="0,8,0,0" FontWeight="SemiBold" Foreground="{StaticResource InkBrush}"/>
             </StackPanel>
           </Border>
@@ -2559,7 +2711,7 @@ $script:TriageXaml = @'
           </Grid.RowDefinitions>
           <Border Grid.Row="0" Margin="12,12,12,10" Padding="14,8,14,8" Background="#FFF3D1" BorderBrush="#C8962B" BorderThickness="4,1,1,1" CornerRadius="6">
             <StackPanel>
-              <TextBlock TextWrapping="Wrap" FontSize="12.5" Foreground="{StaticResource InkBrush}" Text="Large data files (downloads, datasets, videos, archives, model weights). The tool copies the file to the other drive under FromC with the same folder names, checks the copy byte for byte, and only then sends the original to the Recycle Bin. Nothing is overwritten. Files that belong to a program, game, virtual machine or sync folder are not listed: move those with the owning application."/>
+              <TextBlock TextWrapping="Wrap" FontSize="12.5" Foreground="{StaticResource InkBrush}" Text="Large data files (downloads, datasets, videos, archives, model weights). The tool copies the file to the other drive under FromC with the same folder names, reads the copy back and compares it, and only then asks Windows to put the original in the Recycle Bin. Nothing is overwritten. Only plain data file types outside program, application-data and known sync folders are listed. Check that a file is not used by a project or synced to a cloud before moving it."/>
               <CheckBox x:Name="EnableMoveBox" Content="Allow this tool to move files" IsChecked="False" Margin="0,8,0,0" FontWeight="SemiBold" Foreground="{StaticResource InkBrush}"/>
             </StackPanel>
           </Border>
@@ -3357,7 +3509,8 @@ function Invoke-TriageGuiDeleteStore {
         ('Size: ' + (Format-Size -Bytes ([double]$planItem.SizeBytes))),
         ('What it is: ' + [string]$planItem.Note),
         '',
-        'The whole folder goes to the Recycle Bin. You can restore it from there. If Windows says it is too big for the Recycle Bin and offers to delete it permanently, answer No unless you are sure.',
+        'Windows will be asked to put the whole folder in the Recycle Bin, where you can restore it.',
+        'If Windows instead asks whether to delete it PERMANENTLY, answer No: that would not be recoverable.',
         '',
         'Send this folder to the Recycle Bin?'
     )
@@ -3370,15 +3523,30 @@ function Invoke-TriageGuiDeleteStore {
     $record = $null
     $failure = ''
     $failed = $false
+    # Nothing else may start while Windows shows its own dialogs.
+    $script:TriageBusy = $true
+    $c['ScanButton'].IsEnabled = $false
+    $c['ExportButton'].IsEnabled = $false
+    Update-TriageAllActionButtons -Ui $ui
     try {
-        $record = Remove-TriageStore -Item $planItem -LogDirectory $script:TriageGuiReportDir -ShowDialogs
+        $record = Remove-TriageStore -Item $planItem -LogDirectory $script:TriageGuiReportDir
     }
     catch {
         $failed = $true
         $failure = $_.Exception.Message
     }
+    finally {
+        $script:TriageBusy = $false
+        $c['ScanButton'].IsEnabled = $true
+        if ($null -ne $script:TriageLastResult) { $c['ExportButton'].IsEnabled = $true }
+        Update-TriageAllActionButtons -Ui $ui
+    }
     if ($failed) {
         $c['DeleteMessage'].Text = ('Not removed: ' + $failure)
+        return
+    }
+    if ($record.StillExists -eq $true) {
+        $c['DeleteMessage'].Text = ('Not completely removed: {0}. {1} Look at the folder before trying again.' -f [string]$planItem.Path, [string]$record.Detail)
         return
     }
 
@@ -3389,7 +3557,7 @@ function Invoke-TriageGuiDeleteStore {
     $script:TriageDeletePlan = $remaining
     Set-TriageDeleteRows -Ui $ui
 
-    $message = ('Sent to the Recycle Bin: {0}. Empty the Recycle Bin to free the space.' -f [string]$planItem.Path)
+    $message = ('Removed: {0}. Unless Windows told you otherwise, it is in the Recycle Bin; empty the Recycle Bin to free the space.' -f [string]$planItem.Path)
     if (([string]$record.LogPath).Length -gt 0) {
         $message = $message + ' Change log: ' + [string]$record.LogPath
     } else {
@@ -3434,7 +3602,9 @@ function Invoke-TriageGuiMoveFile {
         ('Size: ' + (Format-Size -Bytes ([double]$planItem.SizeBytes))),
         ('New place: ' + [string]$planItem.Target),
         '',
-        'The file is copied, the copy is checked byte for byte, and only then the original goes to the Recycle Bin. This can take several minutes for a large file; the window shows progress and you can cancel.',
+        'The file is copied, the copy is read back and compared with the original, and only then is Windows asked to put the original in the Recycle Bin. This can take several minutes for a large file; the window shows progress and you can cancel.',
+        '',
+        'Please note: the copy gets the permissions of the new folder, so on a shared computer other users may be able to read it. A downloaded file also loses its "came from the internet" mark.',
         '',
         'Move this file?'
     )
@@ -3467,7 +3637,7 @@ function Invoke-TriageGuiMoveFile {
     $failure = ''
     $failed = $false
     try {
-        $record = Move-TriageFile -Item $planItem -LogDirectory $script:TriageGuiReportDir -ShowDialogs -OnProgress $onProgress
+        $record = Move-TriageFile -Item $planItem -LogDirectory $script:TriageGuiReportDir -OnProgress $onProgress
     }
     catch {
         $failed = $true
@@ -3493,7 +3663,7 @@ function Invoke-TriageGuiMoveFile {
     Set-TriageMoveRows -Ui $ui
 
     if ($record.OriginalRecycled -eq $true) {
-        $message = ('Moved and verified: {0}. The original is in the Recycle Bin; empty it to free the space.' -f [string]$record.NewValue)
+        $message = ('Moved and verified: {0}. The original was removed; unless Windows told you otherwise it is in the Recycle Bin, so empty that to free the space.' -f [string]$record.NewValue)
     } else {
         $message = ('Copied and verified: {0}. The original could NOT be sent to the Recycle Bin and is still at {1}; delete it yourself.' -f [string]$record.NewValue, [string]$record.OldValue)
     }

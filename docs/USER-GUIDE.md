@@ -5,7 +5,7 @@ the next, and may make the next one unnecessary.
 
 1. **Delete** - reproducible things. Read the Why column first: an environment needs its package list exported, and `node_modules` needs a lockfile, before it can be rebuilt.
 2. **Redirect** - change the setting and confirm it took effect. Then deal with the old folder: **delete it only if the Why column calls it a cache or re-downloadable; otherwise move its contents.** Recordings, game worlds, run logs and container data are yours, not caches.
-3. **Move** - copy, verify, rename the original, delete it a few days later.
+3. **Move** - copy, verify, then remove the original. The tool does this for plain data files; for anything else, keep the original until you are sure.
 4. **Administrator checklist** - once, by hand.
 
 Aim for 15 to 20 percent free on the system drive, not for an empty drive.
@@ -70,15 +70,17 @@ Recycle Bin to actually free the space.
 - Close the application first for browser, Discord, Slack and Teams caches.
 - After removing `node_modules`, run `npm ci` in that project when you next
   need it.
-- If Windows says the folder is too big for the Recycle Bin and offers to
-  delete it permanently, answer No unless you are sure.
+- Folders too large for the Recycle Bin, or with paths too long for it, are
+  marked "Not possible": Windows could only delete them permanently. Remove
+  those yourself in File Explorer if you are sure.
+- If Windows ever asks whether to delete something permanently, answer No.
 
 ## Move files to the other drive (the tool does it for you)
 
 On the **Move files to the other drive** tab, tick the box, select a file
 marked Ready, and choose **Move selected file**. The file is copied to
-`D:\FromC\<same folders>`, the copy is checked byte for byte, and only then
-does the original go to the Recycle Bin.
+`D:\FromC\<same folders>`, the copy is read back and compared with the
+original, and only then is the original sent to the Recycle Bin.
 
 - You can cancel while it runs; the partial copy is removed and the original
   stays.
@@ -86,9 +88,15 @@ does the original go to the Recycle Bin.
   stops and tells you.
 - Update anything that referred to the old path (a notebook, a config file).
 - Empty the Recycle Bin to free the space on C:.
-- Files that belong to a program, a game, a virtual machine, an iPhone backup
-  or a sync folder are not listed. Move those with the owning application,
-  as described below.
+- Only plain data files outside program folders, `AppData`, hidden tool
+  folders and the usual sync folders are listed. Before moving a file, make
+  sure no project or program still expects it at the old path and that its
+  folder is not synced to a cloud service.
+- The moved copy takes the permissions of the new folder; on a shared PC
+  other users may be able to read it.
+- If a move is interrupted (power cut, closing the black console window), a
+  file ending in `.triage-partial` stays on the other drive. Delete it; the
+  original is untouched.
 
 ## Redirect: the common settings
 

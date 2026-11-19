@@ -67,8 +67,8 @@ Get-FileHash .\DiskSpaceTriage.ps1 -Algorithm SHA256
 
 The scan is read-only. Three tabs can change something. Each has its own
 "Allow" box, acts on one selected item, asks first, and writes what it did to
-`DiskTriage_actions.csv`. Nothing is deleted permanently and nothing is
-overwritten.
+`DiskTriage_actions.csv`. Nothing is overwritten. Removal always goes through
+the Windows Recycle Bin, and items Windows could not recycle are not offered.
 
 **Fix with one setting (Redirect).** For twelve cache stores (`HF_HOME`,
 `TORCH_HOME`, `PIP_CACHE_DIR`, `npm_config_cache`, `OLLAMA_MODELS` and others)
@@ -82,24 +82,33 @@ variable you have already set. **Undo last change** works until you close the
 window; after that, remove the variable under Settings > System > About >
 Advanced system settings > Environment Variables.
 
-**Delete rebuildable folders.** Sends one whole folder to the Recycle Bin.
-Only these are offered: `node_modules` with a lockfile beside it, Rust
-`target\debug` and `target\release` beside a `Cargo.toml`, Steam, GPU and
-DirectX shader caches, crash dumps, and browser, Discord, Slack and classic
-Teams cache folders. A folder is refused if it contains anything that is not
-part of that store, a junction, or anything unreadable. Space is freed when
-you empty the Recycle Bin.
+**Delete rebuildable folders.** Asks Windows to put one whole folder in the
+Recycle Bin. Only these are offered: a project's `node_modules` with a
+`package.json` and a lockfile beside it, Rust `target\debug` and
+`target\release` beside a `Cargo.toml`, Steam, GPU and DirectX shader caches,
+crash dumps, and browser, Discord, Slack and classic Teams folders named
+exactly like a cache (`Cache`, `Code Cache`, `GPUCache` ...). A folder is
+refused if it belongs to an installed application or sits in a sync folder,
+if it contains another store, a virtual disk, a personal file type
+(documents, datasets, model weights, videos, backups), a junction or anything
+unreadable, or if it is too large or has paths too long for the Recycle Bin.
+Space is freed when you empty the Recycle Bin.
 
-**Move files to the other drive.** For large plain data files (downloads,
-datasets, videos, archives, model weights): the file is copied to
-`D:\FromC\<same path>`, the copy is verified byte for byte with SHA-256, and
-only then is the original sent to the Recycle Bin. A cancelled or failed copy
-is removed and the original is left untouched. Files that belong to a
-program, game, virtual machine, backup or sync folder are never offered.
+**Move files to the other drive.** For large data files of known types
+(archives, disk images, videos, datasets, model weights, documents): the file
+is copied to `D:\FromC\<same path>` under a temporary name, read back and
+compared with the original by SHA-256, renamed, and only then is Windows
+asked to put the original in the Recycle Bin. A cancelled or failed copy is
+removed and the original is left untouched. Files under `AppData`,
+`Program Files`, `ProgramData`, hidden tool folders such as `.git`, the usual
+cloud-sync folders, and mail stores are not offered. The tool cannot know
+whether a project refers to a file or whether an unusual folder is synced:
+check before you move.
 
-Everything else stays advice: Docker, WSL, games, virtual machines, the
-Windows known folders, environments, and stores that hold tools or
-credentials (Cargo, Gradle, Yarn, TensorFlow Datasets). The other drive must
+Everything else stays advice: Docker, WSL, games, virtual machines,
+relocating a whole known folder (Downloads, Documents), environments, and
+stores that hold tools or credentials (Cargo, Gradle, Yarn, TensorFlow
+Datasets). The other drive must
 be an internal NTFS disk, and not the Windows drive.
 
 ## Why you can trust it
@@ -110,9 +119,9 @@ These are properties of the code, checked on every commit, not promises.
 | --- | --- |
 | No network access | [`tests/Capability.Tests.ps1`](tests/Capability.Tests.ps1) parses the script and fails the build if any command, .NET type, static call or instance method outside a short allowlist appears. Only local fixed disks are scanned; network drives are refused. CI also runs a real scan with outbound traffic blocked by the firewall. |
 | The scan is read-only | A test compares the names, sizes and timestamps of a scanned tree before and after. No scan function contains a call that can open, write or remove a file. |
-| Nothing is deleted permanently | Removal goes through one Recycle Bin call per action, pinned by a test to its function and to the Recycle Bin option. The single permanent delete in the script removes the tool's own unverified partial copy, and is pinned to that variable. |
-| A move cannot lose data | The destination is opened only as a new file (never overwriting); the copy is re-read and compared by SHA-256 before the original is touched. On CI the tests move a real file, cancel a move, and try to overwrite. |
-| Delete touches only rebuildable stores | The folder is re-examined at the moment of deletion: it must be the top of one listed store, with nothing foreign, linked or unreadable in it. Tests attempt to remove a normal folder, the profile, a sub-folder, a mixed store and a store containing a junction. |
+| Removal goes through the Recycle Bin | One recycle call per action, pinned by a test to its function, to the Recycle Bin option and to the mode in which Windows asks before deleting anything permanently. Both actions refuse to run without an interactive desktop, and items too large or with paths too long for the Recycle Bin are refused beforehand. The only permanent delete in the script removes the tool's own unverified temporary copy. Whether an item finally lands in the Recycle Bin is decided by Windows (for example, if you have turned the Recycle Bin off). |
+| A move never touches the original before the copy is checked | The copy is written under a temporary name as a new file (never overwriting), read back and compared by SHA-256 while the original is held open, and only then renamed. On CI the tests move a real file, cancel during copy and during verification, plant a leftover, and try to overwrite; a test fails if CI could not run them. |
+| Delete is limited to listed stores | The lists of removable stores, cache folder names and movable folders are pinned by a test. The folder is re-examined at the moment of deletion: it must be the top of one listed store, outside installed software and sync folders, with no other store, virtual disk, personal file type, link or unreadable content in it. Tests attempt to remove a normal folder, the profile, a sub-folder, an application's `node_modules`, a store holding a document, and a store containing a junction. The check recognises file types, not meaning: a hand-edited file of an ordinary type inside `node_modules` is not detected. |
 | Changes only what you confirm | The single setter call may appear in exactly two functions, must take its variable name from a list of twelve names pinned by a test, its value from the folder recomputed inside the function, and must target the current user. On CI the tests set a real variable, check the refusals (unknown variable, any other folder, the Windows drive, a non-empty folder, already set) and undo it. |
 | Reads file contents only to move a file | The scan accesses names, sizes, timestamps and attributes only. The one function that opens a file for reading is the copy-and-verify step of Move. |
 | No administrator rights | It refuses to start elevated. CI checks the refusal. |

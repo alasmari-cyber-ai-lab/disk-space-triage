@@ -2,23 +2,29 @@
 
 ## Design
 
-Disk Space Triage is a diagnostic. It is built so that running it cannot make
-anything worse, and so that this can be checked by reading one file.
+Disk Space Triage is a diagnostic with three optional actions. Its scan
+cannot change anything; each action is off until enabled, confirmed per item,
+and narrow enough to be checked by reading one file.
 
 | Threat | Control |
 | --- | --- |
-| The tool damages data | The scan cannot change anything. The Delete action sends one folder to the Recycle Bin, and only if, re-examined at that moment, it is the top of a listed rebuildable store with nothing foreign, linked or unreadable inside. The Move action never overwrites, verifies its copy by SHA-256 before the original is touched, and sends the original to the Recycle Bin. The only permanent delete removes the tool's own unverified partial copy. Each of these calls is pinned to one function and one argument by the capability test. |
+| The tool damages data | The scan cannot change anything. Delete asks Windows to recycle one folder, and only if, re-examined at that moment, it is the top of a listed rebuildable store, outside installed software and sync folders, with no other store, virtual disk, personal file type, link or unreadable content inside, and small enough for the Recycle Bin. Move never overwrites, writes its copy under a temporary name, compares it with the original by SHA-256 while the original is held open, and only then renames it and asks Windows to recycle the original. The only permanent delete removes the tool's own unverified temporary copy. Each of these calls is pinned to one function and one argument by the capability test. |
 | The tool changes settings behind your back | The only setting it can change is a user environment variable from a fixed list of cache locations, and only after you tick the enabling box and confirm that change. It refuses a variable that is already set, any folder other than the one expected folder for that store below `<drive>:\FromC\Users\<you>`, a folder that already has content, the Windows drive, a drive that is not local NTFS, and any path below a junction. Setting a user variable writes one value under `HKCU\Environment`; that is the only registry write the tool makes. System-critical variables (`PATH`, `TEMP`, `APPDATA` ...) are excluded by a test. No change is made unless the log folder is available, and each change is undoable from the window until it is closed. |
 | The tool leaks data | No network commands or types exist in it. Only local fixed disks are scanned, and report folders on network paths are refused. The HTML report loads nothing external. CI runs a scan with outbound traffic blocked. |
 | The tool gains privileges | It needs none and refuses to run elevated. It never requests elevation and performs no token, service or scheduled-task operation, and no registry write other than the user variable described above. |
-| A file on disk attacks the tool | File contents are never read. Paths are treated as untrusted text: they are matched, measured and written into reports as data (JSON-escaped, inserted with `textContent`). |
+| A file on disk attacks the tool | File contents are never interpreted; they are read only to copy and hash a file being moved. Paths are treated as untrusted text: they are matched, measured and written into reports as data (JSON-escaped, inserted with `textContent`). |
 | A junction redirects the scan or the report | Junctions and symbolic links are never followed during the scan. A report folder that is, or sits below, a junction or symbolic link is refused. |
 | A later change quietly adds a capability | `tests/Capability.Tests.ps1` fails the build for any command, .NET type, static call, URL or write location outside the allowlist. |
 
 ## What it does not protect against
 
+- **Windows deciding to delete permanently.** The tool asks for the Recycle Bin and lets Windows show its own prompts. If the Recycle Bin is turned off for a drive, or Windows asks whether to delete permanently and you agree, the item is gone. The tool then reports "removed", not "in the Recycle Bin".
+- **Moved files are less protected.** A file moved out of your profile takes the permissions of the new folder, which on many PCs let every local user read it. Alternate data streams are not copied, so a downloaded file loses its "from the internet" mark. Encrypted (EFS) files are refused.
+- **The copy check.** The copy is read back and compared, which catches a bad copy, but Windows may serve part of that read from memory. It is strong evidence, not proof, that the disk holds the right bytes.
+- **Sync folders the tool does not recognise.** OneDrive, Dropbox, iCloud Drive, Google Drive, Box and similar are recognised in their usual places, and cloud-marked files are refused. A synced folder elsewhere may not be recognised; moving a file out of it removes it from the cloud and from other people's copies.
+- **An interrupted move.** If the process is killed mid-copy, a file ending in `.triage-partial` is left on the destination. It is never given the real name; delete it.
+
 - **A wrong judgement about what is rebuildable.** The Delete list is conservative, but a `node_modules` folder you patched by hand, or a browser cache you wanted, is gone to the Recycle Bin if you confirm. Restore it from there.
-- **The Recycle Bin limit.** If an item is larger than the Recycle Bin allows, Windows offers permanent deletion. The tool shows that Windows prompt rather than suppressing it; the choice is yours.
 - **Moved files and the programs that expect them.** A project that refers to a dataset by its old path must be updated by you.
 
 - **Permissions of redirected folders.** A cache in your profile is private to you. Its replacement below `D:\FromC` inherits the permissions of that drive, which on many PCs let every local user read and change it. On a shared or lab computer, another user could read a Hugging Face token stored there or tamper with cached packages. Use the redirect feature only on a PC you do not share, or tighten the permissions of `D:\FromC\Users\<you>` yourself.

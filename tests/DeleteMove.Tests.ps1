@@ -37,12 +37,30 @@ BeforeAll {
     New-SizedFile "$script:Root\good\node_modules\pkg\index.js" 4096
     New-SizedFile "$script:Root\good\node_modules\pkg\sub\lib.js" 2048
     Set-Content -LiteralPath "$script:Root\good\package-lock.json" -Value '{}'
+    Set-Content -LiteralPath "$script:Root\good\package.json" -Value '{}'
+    # A lockfile but no package.json
+    New-SizedFile "$script:Root\nopkg\node_modules\pkg\index.js" 4096
+    Set-Content -LiteralPath "$script:Root\nopkg\package-lock.json" -Value '{}'
+    # Somebody's document inside node_modules (small, so only the file-type check can see it)
+    New-SizedFile "$script:Root\work\node_modules\pkg\index.js" 4096
+    New-SizedFile "$script:Root\work\node_modules\pkg\thesis.docx" 2048
+    Set-Content -LiteralPath "$script:Root\work\package-lock.json" -Value '{}'
+    Set-Content -LiteralPath "$script:Root\work\package.json" -Value '{}'
+    # An application's own node_modules, with a lockfile, below an AppData-style path
+    New-SizedFile "$script:Root\AppData\Local\Programs\app\resources\app\node_modules\x\index.js" 4096
+    Set-Content -LiteralPath "$script:Root\AppData\Local\Programs\app\resources\app\package-lock.json" -Value '{}'
+    Set-Content -LiteralPath "$script:Root\AppData\Local\Programs\app\resources\app\package.json" -Value '{}'
+    # A real browser cache folder, and a site database whose name merely contains "cache"
+    New-SizedFile "$script:Root\AppData\Local\Vendor\User Data\Default\Cache\data_1" 8192
+    New-SizedFile "$script:Root\AppData\Local\Vendor\User Data\Default\IndexedDB\https_cachefly.net_0.indexeddb.leveldb\000003.log" 8192
     New-SizedFile "$script:Root\nolock\node_modules\pkg\index.js" 4096
     New-SizedFile "$script:Root\mixed\node_modules\pkg\index.js" 4096
     New-SizedFile "$script:Root\mixed\node_modules\pkg\disk.vhdx" (2MB)
     Set-Content -LiteralPath "$script:Root\mixed\package-lock.json" -Value '{}'
+    Set-Content -LiteralPath "$script:Root\mixed\package.json" -Value '{}'
     New-SizedFile "$script:Root\linked\node_modules\pkg\index.js" 4096
     Set-Content -LiteralPath "$script:Root\linked\package-lock.json" -Value '{}'
+    Set-Content -LiteralPath "$script:Root\linked\package.json" -Value '{}'
     New-Item -ItemType Directory -Path "$script:Root\elsewhere" -Force | Out-Null
     New-SizedFile "$script:Root\elsewhere\keep.txt" 100
     cmd /c mklink /J "$script:Root\linked\node_modules\pkg\link" "$script:Root\elsewhere" | Out-Null
@@ -74,6 +92,15 @@ AfterAll {
     if ($script:FromC -and (Test-Path -LiteralPath $script:FromC)) { Remove-Item -LiteralPath $script:FromC -Recurse -Force }
 }
 
+Describe 'Test environment' {
+    It 'is an interactive desktop with a second NTFS drive on CI, so every test below really runs' {
+        if ($env:CI) {
+            [Environment]::UserInteractive | Should -BeTrue
+            $script:Dest | Should -Not -BeNullOrEmpty
+        }
+    }
+}
+
 Describe 'Delete plan' {
     BeforeAll {
         $script:DPlan = @(Get-TriageDeletePlan -Result $script:Result)
@@ -87,6 +114,25 @@ Describe 'Delete plan' {
         $script:ByPath["$script:Root\good\node_modules"].State               | Should -Be 'Ready'
     }
     It 'blocks node_modules without a lockfile'    { $script:ByPath["$script:Root\nolock\node_modules"].State | Should -Be 'Blocked' }
+    It 'blocks node_modules without a package.json' { $script:ByPath["$script:Root\nopkg\node_modules"].State | Should -Be 'Blocked' }
+    It 'blocks a store that contains somebody''s document, however small' {
+        $script:ByPath["$script:Root\work\node_modules"].State  | Should -Be 'Blocked'
+        $script:ByPath["$script:Root\work\node_modules"].Reason | Should -BeLike '*thesis.docx*'
+    }
+    It 'blocks node_modules that belong to an installed application' {
+        $script:ByPath["$script:Root\AppData\Local\Programs\app\resources\app\node_modules"].State | Should -Be 'Blocked'
+    }
+    It 'offers a real cache folder but not a site database whose name contains "cache"' {
+        $script:ByPath["$script:Root\AppData\Local\Vendor\User Data\Default\Cache"].State | Should -Be 'Ready'
+        $script:ByPath["$script:Root\AppData\Local\Vendor\User Data\Default\IndexedDB\https_cachefly.net_0.indexeddb.leveldb"].State | Should -Be 'Blocked'
+    }
+    It 'blocks a store larger than the Recycle Bin would take' {
+        $big = [pscustomobject]@{ Path = "$script:Root\good\node_modules"; Match = ''; Note = 'node_modules; needs a package-lock file to rebuild, never copy'
+                                  TotalBytes = [long]4000GB; Files = [long]1; Mixed = $false; Incomplete = $false; HasLink = $false; Personal = ''; LongPath = $false }
+        @(Get-TriageDeletePlan -Result ([pscustomobject]@{ DeleteCandidates = @($big) }))[0].Reason | Should -BeLike '*too large*'
+        $big.TotalBytes = [long]10; $big.LongPath = $true
+        @(Get-TriageDeletePlan -Result ([pscustomobject]@{ DeleteCandidates = @($big) }))[0].Reason | Should -BeLike '*too long*'
+    }
     It 'blocks a store that contains foreign files' { $script:ByPath["$script:Root\mixed\node_modules"].State  | Should -Be 'Blocked' }
     It 'blocks a store that contains a junction'    { $script:ByPath["$script:Root\linked\node_modules"].State | Should -Be 'Blocked' }
     It 'accepts Rust output only beside a Cargo.toml' {
@@ -110,7 +156,11 @@ Describe 'Remove-TriageStore' {
     It 'refuses the blocked stores even when asked directly' {
         { Remove-TriageStore -Item ([pscustomobject]@{ Path = "$script:Root\nolock\node_modules" }) -LogDirectory $script:Log }   | Should -Throw '*lockfile*'
         { Remove-TriageStore -Item ([pscustomobject]@{ Path = "$script:Root\notrust\target\debug" }) -LogDirectory $script:Log } | Should -Throw '*Cargo.toml*'
-        { Remove-TriageStore -Item ([pscustomobject]@{ Path = "$script:Root\mixed\node_modules" }) -LogDirectory $script:Log }   | Should -Throw '*something else*'
+        { Remove-TriageStore -Item ([pscustomobject]@{ Path = "$script:Root\mixed\node_modules" }) -LogDirectory $script:Log }   | Should -Throw '*another store*'
+        { Remove-TriageStore -Item ([pscustomobject]@{ Path = "$script:Root\work\node_modules" }) -LogDirectory $script:Log }    | Should -Throw '*thesis.docx*'
+        { Remove-TriageStore -Item ([pscustomobject]@{ Path = "$script:Root\nopkg\node_modules" }) -LogDirectory $script:Log }   | Should -Throw '*package.json*'
+        { Remove-TriageStore -Item ([pscustomobject]@{ Path = "$script:Root\AppData\Local\Programs\app\resources\app\node_modules" }) -LogDirectory $script:Log } | Should -Throw '*application*'
+        { Remove-TriageStore -Item ([pscustomobject]@{ Path = "$script:Root\AppData\Local\Vendor\User Data\Default\IndexedDB\https_cachefly.net_0.indexeddb.leveldb" }) -LogDirectory $script:Log } | Should -Throw '*not a plain cache*'
         { Remove-TriageStore -Item ([pscustomobject]@{ Path = "$script:Root\linked\node_modules" }) -LogDirectory $script:Log }  | Should -Throw '*junction*'
     }
     It 'left everything in place after those refusals' {
@@ -125,7 +175,8 @@ Describe 'Remove-TriageStore' {
         Test-Path -LiteralPath "$script:Root\good\node_modules"      | Should -BeFalse
         Test-Path -LiteralPath "$script:Root\good\package-lock.json" | Should -BeTrue
         Test-Path -LiteralPath "$script:Root\nolock\node_modules"    | Should -BeTrue
-        $record.Action | Should -Be 'Recycle'
+        $record.Action      | Should -Be 'Recycle'
+        $record.StillExists | Should -BeFalse
         @(Import-Csv -LiteralPath $record.LogPath)[-1].OldValue | Should -Be "$script:Root\good\node_modules"
     }
 }
@@ -139,6 +190,19 @@ Describe 'Move plan' -Skip:$script:NoOtherDrive {
     }
     It 'does not list files that belong to a game library' {
         @($script:MPlan | Where-Object Path -like '*steamapps*').Count | Should -Be 0
+    }
+    It 'judges movability by location and type' {
+        Test-TriageMovableFile -Path 'C:\Datasets\run\train.parquet'                         | Should -Be ''
+        Test-TriageMovableFile -Path 'C:\Users\a\Downloads\ubuntu.iso'                      | Should -Be ''
+        Test-TriageMovableFile -Path 'C:\Users\a\Documents\repo\.git\objects\pack\p.zip'  | Should -Not -Be ''
+        Test-TriageMovableFile -Path 'C:\Users\a\Documents\db\prod.mdf'                     | Should -Not -Be ''
+        Test-TriageMovableFile -Path 'C:\Users\a\Documents\mail\archive.pst'                | Should -Not -Be ''
+        Test-TriageMovableFile -Path 'C:\Users\a\AppData\Local\Packages\X\LocalState\m.onnx' | Should -Not -Be ''
+        Test-TriageMovableFile -Path 'C:\ProgramData\Package Cache\{guid}\cab1.cab'          | Should -Not -Be ''
+        Test-TriageMovableFile -Path 'C:\Users\a\iCloudDrive\film.mp4'                      | Should -Not -Be ''
+        Test-TriageMovableFile -Path 'C:\Users\a\OneDrive - Contoso\big.zip'                | Should -Not -Be ''
+        Test-TriageMovableFile -Path 'C:\Users\a\Pictures\iCloud Photos\Photos\clip.mov'    | Should -Not -Be ''
+        Test-TriageMovableFile -Path 'C:\Users\ANACON~1\Downloads\x.iso'                    | Should -Not -Be ''
     }
     It 'blocks everything when the destination is the system drive' {
         $p = @(Get-TriageMovePlan -Result $script:Result -DestinationDrive $script:Src)
@@ -169,11 +233,34 @@ Describe 'Move-TriageFile' -Skip:$script:NoOtherDrive {
         (Get-Content -LiteralPath $t -Raw).Trim() | Should -Be 'already here'
         Test-Path -LiteralPath $f | Should -BeTrue
     }
-    It 'leaves no partial copy and keeps the original when cancelled' {
+    It 'leaves no partial copy and keeps the original when cancelled while copying' {
         $f = "$script:Root\data\second.parquet"; $t = "$script:FromC\data\second.parquet"
         { Move-TriageFile -Item ([pscustomobject]@{ Path = $f; Target = $t }) -LogDirectory $script:Log -OnProgress { $script:TriageCancel = $true } } | Should -Throw '*Cancelled*'
-        Test-Path -LiteralPath $t | Should -BeFalse
-        Test-Path -LiteralPath $f | Should -BeTrue
+        Test-Path -LiteralPath $t                       | Should -BeFalse
+        Test-Path -LiteralPath ($t + '.triage-partial') | Should -BeFalse
+        Test-Path -LiteralPath $f                       | Should -BeTrue
+    }
+    It 'does the same when cancelled while verifying' {
+        $f = "$script:Root\data\second.parquet"; $t = "$script:FromC\data\second.parquet"
+        { Move-TriageFile -Item ([pscustomobject]@{ Path = $f; Target = $t }) -LogDirectory $script:Log -OnProgress { param($stage) if ($stage -eq 'Verifying') { $script:TriageCancel = $true } } } | Should -Throw '*Cancelled*'
+        Test-Path -LiteralPath $t                       | Should -BeFalse
+        Test-Path -LiteralPath ($t + '.triage-partial') | Should -BeFalse
+        Test-Path -LiteralPath $f                       | Should -BeTrue
+    }
+    It 'refuses when a leftover from an interrupted move is in the way, and does not delete it' {
+        $f = "$script:Root\data\second.parquet"; $t = "$script:FromC\data\second.parquet"
+        Set-Content -LiteralPath ($t + '.triage-partial') -Value 'leftover'
+        try {
+            { Move-TriageFile -Item ([pscustomobject]@{ Path = $f; Target = $t }) -LogDirectory $script:Log } | Should -Throw '*leftover*'
+            Test-Path -LiteralPath ($t + '.triage-partial') | Should -BeTrue
+            Test-Path -LiteralPath $f | Should -BeTrue
+        } finally { Remove-Item -LiteralPath ($t + '.triage-partial') -Force }
+    }
+    It 'refuses a hidden file' {
+        $f = "$script:Root\data\second.parquet"; $t = "$script:FromC\data\second.parquet"
+        (Get-Item -LiteralPath $f).Attributes = 'Hidden'
+        try { { Move-TriageFile -Item ([pscustomobject]@{ Path = $f; Target = $t }) -LogDirectory $script:Log } | Should -Throw '*hidden*' }
+        finally { (Get-Item -LiteralPath $f -Force).Attributes = 'Normal' }
     }
     It 'copies, verifies, keeps the timestamp, and only then removes the original' {
         $record = Move-TriageFile -Item ([pscustomobject]@{ Path = $script:File; Target = $script:Target }) -LogDirectory $script:Log
@@ -183,6 +270,9 @@ Describe 'Move-TriageFile' -Skip:$script:NoOtherDrive {
         (Get-Item -LiteralPath $script:Target).LastWriteTimeUtc | Should -Be ([datetime]'2024-03-02T10:20:30Z').ToUniversalTime()
         $record.OriginalRecycled               | Should -BeTrue
         Test-Path -LiteralPath $script:File    | Should -BeFalse
-        @(Import-Csv -LiteralPath $record.LogPath)[-1].NewValue | Should -Be $script:Target
+        Test-Path -LiteralPath ($script:Target + '.triage-partial') | Should -BeFalse
+        $logged = @(Import-Csv -LiteralPath $record.LogPath)[-1]
+        $logged.NewValue | Should -Be $script:Target
+        $logged.Detail   | Should -Be ('SHA256 ' + $script:Hash)
     }
 }

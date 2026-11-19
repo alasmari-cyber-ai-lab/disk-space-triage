@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests (${{ matrix.shell }})
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]   # Windows PowerShell 5.1 and PowerShell 7
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install test tools
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          Install-Module Pester -MinimumVersion 5.5.0 -Force -Scope CurrentUser -SkipPublisherCheck
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          $PSVersionTable.PSVersion
+
+      - name: Static analysis
+        run: |
+          $findings = Invoke-ScriptAnalyzer -Path .\DiskSpaceTriage.ps1 -Settings .\PSScriptAnalyzerSettings.psd1
+          $findings | Format-Table RuleName, Severity, Line, Message -AutoSize -Wrap | Out-String -Width 220
+          if (@($findings | Where-Object Severity -in 'Error', 'ParseError').Count -gt 0) { throw 'PSScriptAnalyzer reported errors.' }
+
+      - name: Unit, oracle and capability tests
+        run: |
+          Import-Module Pester -MinimumVersion 5.5.0
+          $config = New-PesterConfiguration
+          $config.Run.Path = 'tests'
+          $config.Run.Exit = $true
+          $config.Output.Verbosity = 'Normal'
+          $config.TestResult.Enabled = $true
+          $config.TestResult.OutputPath = "test-results-${{ matrix.shell }}.xml"
+          Invoke-Pester -Configuration $config
+
+      - name: Self-test (rules, report, off-screen window)
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'selftest'
+          # Hosted runners are administrators, so the elevation guard must be overridden here.
+          & .\DiskSpaceTriage.ps1 -Mode SelfTest -ReportDirectory $out -AllowElevated
+          Get-ChildItem $out | Format-Table Name, Length
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ matrix.shell }}
+          path: |
+            test-results-*.xml
+            ${{ runner.temp }}/selftest/*
+          if-no-files-found: warn
+
+  offline:
+    name: Real scan with the network blocked
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Block all outbound traffic for PowerShell
+        run: |
+          Set-NetFirewallProfile -All -Enabled True
+          $exe = (Get-Process -Id $PID).Path
+          New-NetFirewallRule -DisplayName 'triage-ci-block-out' -Direction Outbound -Program $exe -Action Block | Out-Null
+          $blocked = $false
+          try { Invoke-WebRequest -Uri 'https://example.com' -UseBasicParsing -TimeoutSec 15 | Out-Null } catch { $blocked = $true }
+          if (-not $blocked) { throw 'The firewall rule did not block outbound traffic; this job would prove nothing.' }
+          Write-Host 'Outbound traffic from PowerShell is blocked.'
+
+      - name: Console scan of the runner profile
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'scan'
+          & .\DiskSpaceTriage.ps1 -Mode Console -MinSizeMB 50 -MaxDepth 8 -ReportDirectory $out -AllowElevated
+          if (@(Get-ChildItem $out -Filter *.html).Count -ne 1) { throw 'No HTML report was produced.' }
+
+      - name: Self-test
+        run: |
+          & .\DiskSpaceTriage.ps1 -Mode SelfTest -ReportDirectory (Join-Path $env:RUNNER_TEMP 'scan') -AllowElevated
+
+      - name: Refuses to run elevated without the override
+        run: |
+          powershell -NoProfile -File .\DiskSpaceTriage.ps1 -Mode Console
+          if ($LASTEXITCODE -ne 2) { throw "Expected exit code 2 from the elevation guard, got $LASTEXITCODE." }
+          Write-Host 'Elevation guard works.'
+          exit 0
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: offline-scan
+          path: ${{ runner.temp }}/scan/*
+          if-no-files-found: warn

@@ -1,0 +1,20 @@
+# Never commit scan output: reports contain real file paths from a machine.
+DiskTriage_*.html
+DiskTriage_*.md
+DiskTriage_*.csv
+DiskReports/
+selftest-*
+test-results*.xml
+# Data, models and credentials do not belong in this repository.
+*.safetensors
+*.ckpt
+*.gguf
+*.pt
+*.pth
+*.onnx
+*.parquet
+*.h5
+.env
+*.pem
+*.key
+__pycache__/

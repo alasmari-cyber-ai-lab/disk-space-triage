@@ -1569,8 +1569,8 @@ $script:TriageXaml = @'
           <DataGrid.Columns>
             <DataGridTextColumn Header="Size" Binding="{Binding SizeText, Mode=OneWay}" SortMemberPath="TotalBytes" Width="110" ElementStyle="{StaticResource CellRight}" HeaderStyle="{StaticResource HeaderRight}"/>
             <DataGridTextColumn Header="Bucket" Binding="{Binding Bucket, Mode=OneWay}" Width="90" ElementStyle="{StaticResource CellText}"/>
-            <DataGridTextColumn Header="What to do" Binding="{Binding Mechanism, Mode=OneWay}" Width="2*" ElementStyle="{StaticResource CellWrap}"/>
-            <DataGridTextColumn Header="Why" Binding="{Binding Note, Mode=OneWay}" Width="2*" ElementStyle="{StaticResource CellWrap}"/>
+            <DataGridTextColumn Header="What to do" Binding="{Binding Mechanism, Mode=OneWay}" Width="2*" MinWidth="240" ElementStyle="{StaticResource CellWrap}"/>
+            <DataGridTextColumn Header="Why" Binding="{Binding Note, Mode=OneWay}" Width="2*" MinWidth="240" ElementStyle="{StaticResource CellWrap}"/>
             <DataGridTextColumn Header="Files" Binding="{Binding FilesText, Mode=OneWay}" SortMemberPath="Files" Width="90" ElementStyle="{StaticResource CellRight}" HeaderStyle="{StaticResource HeaderRight}"/>
           </DataGrid.Columns>
         </DataGrid>
@@ -1601,7 +1601,7 @@ $script:TriageXaml = @'
               <DataGridTextColumn Header="What to do" Binding="{Binding Mechanism, Mode=OneWay}" Width="190" ElementStyle="{StaticResource CellTrim}"/>
               <DataGridTextColumn Header="Idle days" Binding="{Binding DaysIdle, Mode=OneWay}" Width="80" ElementStyle="{StaticResource CellRight}" HeaderStyle="{StaticResource HeaderRight}"/>
               <DataGridTextColumn Header="Last write" Binding="{Binding LastWrite, Mode=OneWay}" Width="100" ElementStyle="{StaticResource CellText}"/>
-              <DataGridTextColumn Header="Path" Binding="{Binding Path, Mode=OneWay}" Width="*" ElementStyle="{StaticResource CellTrim}"/>
+              <DataGridTextColumn Header="Path" Binding="{Binding Path, Mode=OneWay}" Width="*" MinWidth="240" ElementStyle="{StaticResource CellTrim}"/>
             </DataGrid.Columns>
           </DataGrid>
         </Grid>
@@ -1611,7 +1611,7 @@ $script:TriageXaml = @'
         <DataGrid x:Name="FoldersGrid" Style="{StaticResource GridStyle}" AutoGenerateColumns="False" IsReadOnly="True" CanUserAddRows="False" HeadersVisibility="Column" GridLinesVisibility="Horizontal">
           <DataGrid.Columns>
             <DataGridTextColumn Header="Size" Binding="{Binding SizeText, Mode=OneWay}" SortMemberPath="TotalBytes" Width="120" ElementStyle="{StaticResource CellRight}" HeaderStyle="{StaticResource HeaderRight}"/>
-            <DataGridTextColumn Header="Folder" Binding="{Binding Folder, Mode=OneWay}" Width="*" ElementStyle="{StaticResource CellTrim}"/>
+            <DataGridTextColumn Header="Folder" Binding="{Binding Folder, Mode=OneWay}" Width="*" MinWidth="240" ElementStyle="{StaticResource CellTrim}"/>
           </DataGrid.Columns>
         </DataGrid>
       </TabItem>
@@ -1626,7 +1626,7 @@ $script:TriageXaml = @'
           <DataGrid x:Name="ElevatedGrid" Grid.Row="1" Style="{StaticResource GridStyle}" AutoGenerateColumns="False" IsReadOnly="True" CanUserAddRows="False" HeadersVisibility="Column" GridLinesVisibility="Horizontal">
             <DataGrid.Columns>
               <DataGridTextColumn Header="Item" Binding="{Binding Item, Mode=OneWay}" Width="220" ElementStyle="{StaticResource CellWrap}"/>
-              <DataGridTextColumn Header="Action" Binding="{Binding Action, Mode=OneWay}" Width="*" ElementStyle="{StaticResource CellWrap}"/>
+              <DataGridTextColumn Header="Action" Binding="{Binding Action, Mode=OneWay}" Width="*" MinWidth="240" ElementStyle="{StaticResource CellWrap}"/>
             </DataGrid.Columns>
           </DataGrid>
         </Grid>
@@ -1991,6 +1991,12 @@ function Test-TriageGui {
 
     $root = $w.Content
     # Give the content root the full bitmap area so the PNG has no empty margin.
+    $root.Measure($size)
+    $root.Arrange($rect)
+    $root.UpdateLayout()
+    # Star-sized grid columns are resolved by queued dispatcher work; let it
+    # run, then lay out once more so the picture matches a shown window.
+    $w.Dispatcher.Invoke([System.Action]{ }, [System.Windows.Threading.DispatcherPriority]::ApplicationIdle)
     $root.Measure($size)
     $root.Arrange($rect)
     $root.UpdateLayout()

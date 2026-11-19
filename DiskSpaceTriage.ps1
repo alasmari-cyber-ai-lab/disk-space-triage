@@ -2076,8 +2076,8 @@ $script:TriageXaml = @'
             <DataGrid.Columns>
               <DataGridTextColumn Header="Size now" Binding="{Binding SizeText, Mode=OneWay}" SortMemberPath="SizeBytes" Width="100" ElementStyle="{StaticResource CellRight}" HeaderStyle="{StaticResource HeaderRight}"/>
               <DataGridTextColumn Header="Variable" Binding="{Binding Variable, Mode=OneWay}" Width="150" ElementStyle="{StaticResource CellBold}"/>
-              <DataGridTextColumn Header="New folder" Binding="{Binding ProposedValue, Mode=OneWay}" Width="3*" MinWidth="300" ElementStyle="{StaticResource CellWrap}"/>
-              <DataGridTextColumn Header="Status" Binding="{Binding StatusText, Mode=OneWay}" Width="120" ElementStyle="{StaticResource CellWrap}"/>
+              <DataGridTextColumn Header="New folder" Binding="{Binding ProposedValue, Mode=OneWay}" Width="2*" MinWidth="260" ElementStyle="{StaticResource CellWrap}"/>
+              <DataGridTextColumn Header="Status" Binding="{Binding StatusText, Mode=OneWay}" Width="230" ElementStyle="{StaticResource CellWrap}"/>
               <DataGridTextColumn Header="What happens" Binding="{Binding Effect, Mode=OneWay}" Width="2*" MinWidth="260" ElementStyle="{StaticResource CellWrap}"/>
             </DataGrid.Columns>
           </DataGrid>

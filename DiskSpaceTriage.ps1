@@ -3085,7 +3085,7 @@ $script:TriageXaml = @'
         <Border Width="268" Margin="0,0,8,0" Padding="12,8,12,10" Style="{StaticResource Card}">
           <StackPanel>
             <Grid>
-              <TextBlock Text="Drive to free up" FontSize="12" Foreground="{StaticResource MutedBrush}"/>
+              <TextBlock Text="Free up" FontSize="12" Foreground="{StaticResource MutedBrush}"/>
               <TextBlock x:Name="SourceDriveStatus" Text="-" FontSize="12" HorizontalAlignment="Right" FontWeight="SemiBold" Foreground="{StaticResource MutedBrush}"/>
             </Grid>
             <TextBlock x:Name="SourceDriveLabel" Text="-" Margin="0,4,0,0" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" Foreground="{StaticResource InkBrush}"/>
@@ -3095,7 +3095,7 @@ $script:TriageXaml = @'
         <Border Width="268" Padding="12,8,12,10" Style="{StaticResource Card}">
           <StackPanel>
             <Grid>
-              <TextBlock Text="Drive to move things to" FontSize="12" Foreground="{StaticResource MutedBrush}"/>
+              <TextBlock Text="Move to" FontSize="12" Foreground="{StaticResource MutedBrush}"/>
               <TextBlock x:Name="DestDriveStatus" Text="-" FontSize="12" HorizontalAlignment="Right" FontWeight="SemiBold" Foreground="{StaticResource MutedBrush}"/>
             </Grid>
             <TextBlock x:Name="DestDriveLabel" Text="-" Margin="0,4,0,0" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" Foreground="{StaticResource InkBrush}"/>
@@ -3724,6 +3724,17 @@ function Get-TriageRowStatus {
     return $State
 }
 
+function Get-TriageHint {
+    # The standing instruction below an action list.
+    param($Plan, [string]$StateName, [string]$Button)
+    $ready = 0
+    foreach ($p in @($Plan)) {
+        if ([string]$p.$StateName -eq 'Ready') { $ready = $ready + 1 }
+    }
+    if ($ready -eq 0) { return 'None of these is possible right now. The Status column says why for each row.' }
+    return ('{0:N0} row(s) are Ready. Select one, then choose {1}. You are asked to confirm before anything happens.' -f $ready, $Button)
+}
+
 function Update-TriageAllActionButtons {
     # No button is ever switched off because of what is selected: a button
     # that cannot act says why when it is chosen. Buttons pause only while a
@@ -3880,7 +3891,7 @@ function Update-TriageRedirectGrid {
         }
     }
     elseif (([string]$c['RedirectMessage'].Text).Length -eq 0) {
-        $c['RedirectMessage'].Text = 'Select a row marked Ready, then choose Move to the other drive. You are asked to confirm before anything happens.'
+        $c['RedirectMessage'].Text = Get-TriageHint -Plan $plan -StateName 'MoveState' -Button 'Move to the other drive'
     }
 }
 
@@ -3910,7 +3921,7 @@ function Update-TriageDeleteGrid {
         }
     }
     elseif (([string]$c['DeleteMessage'].Text).Length -eq 0) {
-        $c['DeleteMessage'].Text = 'Select a row marked Ready, then choose Delete. You are asked to confirm before anything happens.'
+        $c['DeleteMessage'].Text = Get-TriageHint -Plan $plan -StateName 'State' -Button 'Delete'
     }
 }
 
@@ -3940,7 +3951,7 @@ function Update-TriageMoveGrid {
         }
     }
     elseif (([string]$c['MoveMessage'].Text).Length -eq 0) {
-        $c['MoveMessage'].Text = 'Select a row marked Ready, then choose Move this file. You are asked to confirm before anything happens.'
+        $c['MoveMessage'].Text = Get-TriageHint -Plan $plan -StateName 'State' -Button 'Move this file'
     }
 }
 

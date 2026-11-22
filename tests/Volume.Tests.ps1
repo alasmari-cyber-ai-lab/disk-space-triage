@@ -220,6 +220,8 @@ Describe 'Move a store: contents, setting and space' -Skip:$script:NoVolumes {
         Test-Path -LiteralPath "$script:Store\a\big.bin" | Should -BeTrue
     }
     It 'copies and verifies every file, sets the variable, and recycles the old folder' {
+        # Earlier tests aborted on purpose; make sure nothing they opened is still held.
+        [GC]::Collect(); [GC]::WaitForPendingFinalizers()
         $script:Rec = Move-TriageStore -Item $script:Item -LogDirectory $script:Log
         $script:Rec.Action           | Should -Be 'Move store'
         $script:Rec.OriginalRecycled | Should -BeTrue

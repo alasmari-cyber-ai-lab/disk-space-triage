@@ -1971,7 +1971,10 @@ function Get-TriageStoreInventory {
         $seen = $seen + 1
         if ($null -ne $OnProgress -and ($seen % 100) -eq 0) { & $OnProgress 'Listing' 0 0 }
         $info = New-Object System.IO.DirectoryInfo ([string]$queue.Dequeue())
-        foreach ($entry in $info.EnumerateFileSystemInfos()) {
+        # Read each folder to the end before judging its entries, so that
+        # refusing one never leaves the folder open behind us.
+        $entries = @($info.EnumerateFileSystemInfos())
+        foreach ($entry in $entries) {
             # ReparsePoint, Offline, RecallOnDataAccess, Encrypted. A copy of an
             # encrypted file would land unencrypted on the other drive.
             if (([int]$entry.Attributes -band 0x405400) -ne 0) { throw "it contains a link, a cloud placeholder or an encrypted file ($($entry.FullName))" }

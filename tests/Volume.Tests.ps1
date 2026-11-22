@@ -12,6 +12,8 @@ BeforeDiscovery {
 }
 
 BeforeAll {
+    # Discovery-time variables do not exist at run time; work it out again.
+    $script:NoVolumes = [string]::IsNullOrEmpty($env:TRIAGE_VOLUME_SOURCE) -or [string]::IsNullOrEmpty($env:TRIAGE_VOLUME_DEST)
     . (Join-Path $PSScriptRoot '..\DiskSpaceTriage.ps1') -ImportOnly
 
     $script:S = [string]$env:TRIAGE_VOLUME_SOURCE

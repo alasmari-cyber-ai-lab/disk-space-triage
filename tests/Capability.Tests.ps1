@@ -29,16 +29,16 @@ BeforeAll {
         'Where-Object', 'ForEach-Object', 'Select-Object', 'Sort-Object',
         'Format-Table', 'Out-Host', 'Out-Null',
         'Test-Path', 'Join-Path', 'Get-Date', 'ConvertTo-Json', 'Get-Item',
-        'Out-File', 'Export-Csv', 'New-Item'
+        'Out-File', 'Export-Csv', 'New-Item', 'Clear-RecycleBin'
     )
 
     $script:AllowedTypes = @(
         'Environment', 'math', 'void', 'bool', 'char', 'double', 'int', 'long', 'object', 'string', 'string[]',
-        'switch', 'hashtable', 'scriptblock', 'pscustomobject', 'Parameter', 'CmdletBinding',
+        'switch', 'hashtable', 'scriptblock', 'pscustomobject', 'datetime', 'Parameter', 'CmdletBinding',
         'ValidateSet', 'ValidatePattern', 'ValidateRange',
         'Security.Principal.WindowsIdentity', 'Security.Principal.WindowsBuiltInRole',
         'System.Action', 'System.StringComparison', 'System.Globalization.CultureInfo',
-        'System.IO.FileAttributes', 'System.IO.Path', 'System.IO.File', 'System.IO.IOException',
+        'System.IO.FileAttributes', 'System.IO.Path', 'System.IO.File', 'System.IO.Directory', 'System.IO.IOException',
         'System.UnauthorizedAccessException', 'System.Security.SecurityException',
         'System.Management.Automation.WildcardOptions', 'System.Text.RegularExpressions.RegexOptions',
         'System.Security.Cryptography.SHA256', 'System.BitConverter', 'System.IO.FileMode', 'System.IO.FileAccess', 'System.IO.FileShare',
@@ -46,7 +46,8 @@ BeforeAll {
         'System.Windows.Clipboard', 'System.Windows.MessageBox', 'System.Windows.MessageBoxButton',
         'System.Windows.MessageBoxImage', 'System.Windows.MessageBoxResult', 'System.Windows.Markup.XamlReader',
         'System.Windows.Media.Imaging.BitmapFrame', 'System.Windows.Media.PixelFormats',
-        'System.Windows.Threading.DispatcherPriority'
+        'System.Windows.Threading.DispatcherPriority',
+        'System.Windows.SystemParameters', 'System.Windows.SystemColors', 'Microsoft.Win32.Registry'
     )
 
     $script:AllowedNewObject = @(
@@ -77,12 +78,16 @@ BeforeAll {
     $script:AllowedStaticMembers = @{
         'System.IO.File'                    = @('Create', 'OpenRead', 'Delete', 'SetLastWriteTimeUtc', 'Move')
         'System.Security.Cryptography.SHA256' = @('Create')
-        'System.BitConverter'               = @('ToString')
+        'System.BitConverter'               = @('ToString', 'ToInt64')
+        'System.IO.Directory'               = @('Delete')
+        'Microsoft.Win32.Registry'          = @('GetValue')
+        'System.Windows.SystemParameters'   = @('HighContrast')
+        'System.Windows.SystemColors'       = @('WindowColor', 'WindowTextColor', 'HighlightColor', 'HighlightTextColor', 'GrayTextColor')
         'Microsoft.VisualBasic.FileIO.FileSystem' = @('DeleteDirectory', 'DeleteFile')
         'System.IO.Path'                    = @('GetFullPath', 'GetDirectoryName', 'GetFileName')
         'scriptblock'                       = @()
         'System.Globalization.CultureInfo'  = @('InvariantCulture')
-        'Environment'                       = @('GetFolderPath', 'GetEnvironmentVariable', 'SetEnvironmentVariable', 'UserInteractive')
+        'Environment'                       = @('GetFolderPath', 'GetEnvironmentVariable', 'SetEnvironmentVariable', 'UserInteractive', 'OSVersion')
         'System.Windows.Markup.XamlReader'  = @('Parse')
         'System.Windows.Clipboard'          = @('SetText')
         'System.Windows.MessageBox'         = @('Show')
@@ -146,7 +151,7 @@ Describe 'Commands' {
 
     It 'writes files only from the report, self-test and action-log functions' {
         $writers = @('Out-File', 'Export-Csv', 'New-Item')
-        $allowedIn = @('Export-TriageReport', 'Resolve-ReportDirectory', 'Invoke-TriageSelfTest', 'Set-TriageRedirect', 'Write-TriageActionLog', 'Move-TriageFile')
+        $allowedIn = @('Export-TriageReport', 'Resolve-ReportDirectory', 'Invoke-TriageSelfTest', 'Set-TriageRedirect', 'Write-TriageActionLog', 'Move-TriageFile', 'Move-TriageStore')
         $bad = foreach ($c in ($script:Commands | Where-Object { $writers -contains $_.GetCommandName() })) {
             $where = Get-EnclosingFunction -Node $c
             if ($allowedIn -notcontains $where) { "$($c.GetCommandName()) in $where (line $($c.Extent.StartLineNumber))" }
@@ -189,6 +194,11 @@ Describe '.NET surface' {
             if ($script:AllowedInstanceMethods -notcontains $name) { ".$name() (line $($call.Extent.StartLineNumber))" }
         }
         @($bad | Sort-Object -Unique) | Should -BeNullOrEmpty
+    }
+
+    It 'has only pure caches in the list where an existing new file may win' {
+        . $script:ScriptPath -ImportOnly
+        (@($script:TriagePureCaches.Keys | Sort-Object) -join ',') | Should -Be 'COMPOSER_CACHE_DIR,GOMODCACHE,npm_config_cache,NUGET_PACKAGES,PIP_CACHE_DIR,TRITON_CACHE_DIR,UV_CACHE_DIR'
     }
 
     It 'uses Dispatcher.Invoke only with an empty action, and Save only on the screenshot encoder' {
@@ -257,6 +267,7 @@ Describe '.NET surface' {
         $newItems = @($script:Commands | Where-Object { $_.GetCommandName() -eq 'New-Item' })
         foreach ($c in $newItems) { ($c.Extent.Text -replace '\s+', ' ') | Should -Match '^New-Item -ItemType Directory -Path \$(value|target|folder) -Force$' }
         @($newItems | Where-Object { (Get-EnclosingFunction -Node $_) -eq 'Set-TriageRedirect' }).Count | Should -Be 1
+        @($newItems | Where-Object { (Get-EnclosingFunction -Node $_) -eq 'Move-TriageStore' }).Count   | Should -Be 1
     }
 
     It 'pins every call that can create, delete or change a file to one function and one argument' {
@@ -271,33 +282,45 @@ Describe '.NET surface' {
         $create.Count | Should -Be 1
         Get-EnclosingFunction -Node $create[0] | Should -Be 'Save-TriageWindowPng'
 
-        # Reading file contents happens only while moving a file
+        # File contents are read only while copying or comparing; the Recycle
+        # Bin size comes from the bin's own 16-byte index records.
         foreach ($call in (Get-Calls 'System.IO.File' 'OpenRead')) {
-            Get-EnclosingFunction -Node $call | Should -BeIn @('Move-TriageFile', 'Get-TriageFileHash')
+            Get-EnclosingFunction -Node $call | Should -BeIn @('Copy-TriageVerifiedFile', 'Get-TriageFileHash', 'Get-TriageRecycleBinInfo')
         }
 
-        # The only permanent delete: an unverified partial copy the tool itself just created
-        $delete = Get-Calls 'System.IO.File' 'Delete'
-        $delete.Count | Should -Be 1
-        Get-EnclosingFunction -Node $delete[0] | Should -Be 'Move-TriageFile'
-        $delete[0].Arguments[0].Extent.Text    | Should -Be '$partial' -Because 'only the temporary copy may ever be deleted'
+        # Permanent deletes by the script itself: only copies it has just made.
+        $delete = @(Get-Calls 'System.IO.File' 'Delete')
+        $delete.Count | Should -Be 2
+        $partialDelete = @($delete | Where-Object { (Get-EnclosingFunction -Node $_) -eq 'Copy-TriageVerifiedFile' })
+        $partialDelete.Count | Should -Be 1
+        $partialDelete[0].Arguments[0].Extent.Text | Should -Be '$partial' -Because 'only the unverified temporary copy may be deleted here'
+        $rollback = @($delete | Where-Object { (Get-EnclosingFunction -Node $_) -eq 'Undo-TriageStoreCopy' })
+        $rollback.Count | Should -Be 1
+        $rollback[0].Arguments[0].Extent.Text | Should -Be '$created' -Because 'a rollback may delete only files from the list of copies it made'
 
-        $stamp = Get-Calls 'System.IO.File' 'SetLastWriteTimeUtc'
+        # Folders: removed only by the rollback, and only when empty (one argument)
+        $rmdir = @(Get-Calls 'System.IO.Directory' 'Delete')
+        $rmdir.Count | Should -Be 1
+        Get-EnclosingFunction -Node $rmdir[0] | Should -Be 'Undo-TriageStoreCopy'
+        $rmdir[0].Arguments.Count | Should -Be 1 -Because 'the two-argument form deletes recursively'
+
+        $stamp = @(Get-Calls 'System.IO.File' 'SetLastWriteTimeUtc')
         $stamp.Count | Should -Be 1
         $stamp[0].Arguments[0].Extent.Text | Should -Be '$partial'
 
         # The temporary copy gets its real name in one place, and only that way round
         $rename = @(Get-Calls 'System.IO.File' 'Move')
         $rename.Count | Should -Be 1
-        Get-EnclosingFunction -Node $rename[0] | Should -Be 'Move-TriageFile'
+        Get-EnclosingFunction -Node $rename[0] | Should -Be 'Copy-TriageVerifiedFile'
         $rename[0].Arguments[0].Extent.Text | Should -Be '$partial'
         $rename[0].Arguments[1].Extent.Text | Should -Be '$destination'
 
-        # Recycle Bin only, never a permanent delete
-        $recycleDir = Get-Calls 'Microsoft.VisualBasic.FileIO.FileSystem' 'DeleteDirectory'
-        $recycleDir.Count | Should -Be 1
-        Get-EnclosingFunction -Node $recycleDir[0] | Should -Be 'Remove-TriageStore'
-        $recycleFile = Get-Calls 'Microsoft.VisualBasic.FileIO.FileSystem' 'DeleteFile'
+        # Recycle Bin only, never a silent permanent delete
+        $recycleDir = @(Get-Calls 'Microsoft.VisualBasic.FileIO.FileSystem' 'DeleteDirectory')
+        $recycleDir.Count | Should -Be 2
+        (@($recycleDir | ForEach-Object { Get-EnclosingFunction -Node $_ } | Sort-Object) -join ',') | Should -Be 'Move-TriageStore,Remove-TriageStore'
+        ($recycleDir | Where-Object { (Get-EnclosingFunction -Node $_) -eq 'Move-TriageStore' }).Arguments[0].Extent.Text | Should -Be '$source' -Because 'the old folder is recomputed inside the function, never taken from the caller'
+        $recycleFile = @(Get-Calls 'Microsoft.VisualBasic.FileIO.FileSystem' 'DeleteFile')
         $recycleFile.Count | Should -Be 1
         Get-EnclosingFunction -Node $recycleFile[0] | Should -Be 'Move-TriageFile'
         $recycleFile[0].Arguments[0].Extent.Text    | Should -Be '$source'
@@ -308,8 +331,49 @@ Describe '.NET surface' {
         }
     }
 
-    It 'refuses both actions without an interactive desktop' {
-        foreach ($name in @('Remove-TriageStore', 'Move-TriageFile')) {
+    It 'empties the Recycle Bin in one place only, for one drive, through Windows' {
+        $clear = @($script:Commands | Where-Object { $_.GetCommandName() -eq 'Clear-RecycleBin' })
+        $clear.Count | Should -Be 1
+        Get-EnclosingFunction -Node $clear[0] | Should -Be 'Clear-TriageRecycleBin'
+        ($clear[0].Extent.Text -replace '\s+', ' ') | Should -Be 'Clear-RecycleBin -DriveLetter $drive -Force -ErrorAction Stop'
+        # ... and the window calls that function from exactly one handler, after its confirmation.
+        $callers = @($script:Commands | Where-Object { $_.GetCommandName() -eq 'Clear-TriageRecycleBin' } | ForEach-Object { Get-EnclosingFunction -Node $_ })
+        ($callers -join ',') | Should -Be 'Invoke-TriageGuiEmptyBin'
+    }
+
+    It 'reads exactly one registry value (the app theme) and writes none' {
+        $static = @($script:Ast.FindAll({ param($n)
+            $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and $n.Static -and
+            $n.Expression.Extent.Text -eq '[Microsoft.Win32.Registry]' }, $true))
+        $static.Count | Should -Be 1
+        Get-EnclosingFunction -Node $static[0] | Should -Be 'Get-TriageTheme'
+        $static[0].Extent.Text | Should -Be "[Microsoft.Win32.Registry]::GetValue('HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize', 'AppsUseLightTheme', 1)"
+    }
+
+    It 'asks for confirmation, with No as the default answer, before every action' {
+        foreach ($name in @('Invoke-TriageGuiMoveStore', 'Invoke-TriageGuiApplyRedirect', 'Invoke-TriageGuiUndoRedirect', 'Invoke-TriageGuiDeleteStore', 'Invoke-TriageGuiMoveFile', 'Invoke-TriageGuiEmptyBin')) {
+            $fn = $script:Ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
+            $fn | Should -Not -BeNullOrEmpty -Because $name
+            $body  = $fn.Body.Extent.Text
+            $ask   = $body.IndexOf('[System.Windows.MessageBoxButton]::YesNo')
+            $ask   | Should -BeGreaterThan 0 -Because "$name must ask"
+            $body.Substring($ask) | Should -Match '^\[System\.Windows\.MessageBoxButton\]::YesNo, \[System\.Windows\.MessageBoxImage\]::(Question|Warning), \[System\.Windows\.MessageBoxResult\]::No\)' -Because "$name must default to No"
+            $act = [regex]::Match($body, '(Move-TriageStore|Set-TriageRedirect|Undo-TriageRedirect|Remove-TriageStore|Move-TriageFile|Clear-TriageRecycleBin) -').Index
+            $act | Should -BeGreaterThan $ask -Because "$name must ask before it acts"
+        }
+    }
+
+    It 'never switches a button off in the window definition, except Cancel while idle' {
+        $xaml = @($script:Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) |
+            Where-Object { $_.Value -like '<Window*' })[0].Value
+        $off = [regex]::Matches($xaml, '<[^>]*IsEnabled="False"[^>]*>')
+        $off.Count | Should -Be 1
+        $off[0].Value | Should -Match 'x:Name="CancelButton"'
+        $xaml | Should -Not -Match '<CheckBox' -Because 'no action may hide behind an enabling tick box'
+    }
+
+    It 'refuses the recycling actions without an interactive desktop' {
+        foreach ($name in @('Remove-TriageStore', 'Move-TriageFile', 'Move-TriageStore')) {
             $fn = $script:Ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
             $fn.Body.Extent.Text | Should -Match 'if \(-not \(Test-TriageInteractive\)\) \{ throw'
         }
@@ -329,7 +393,7 @@ Describe '.NET surface' {
     It 'opens a file for writing in exactly one place, and only as a new file' {
         $streams = @($script:Commands | Where-Object { $_.GetCommandName() -eq 'New-Object' -and $_.Extent.Text -match 'System\.IO\.FileStream' })
         $streams.Count | Should -Be 1
-        Get-EnclosingFunction -Node $streams[0] | Should -Be 'Move-TriageFile'
+        Get-EnclosingFunction -Node $streams[0] | Should -Be 'Copy-TriageVerifiedFile'
         $streams[0].Extent.Text | Should -Match '^New-Object System\.IO\.FileStream\(\$partial, \[System\.IO\.FileMode\]::CreateNew, '
         @($script:Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.MemberExpressionAst] -and $n.Static -and
             $n.Expression.Extent.Text -eq '[System.IO.FileMode]' }, $true) | ForEach-Object { $_.Member.Extent.Text } | Sort-Object -Unique) | Should -Be @('CreateNew')

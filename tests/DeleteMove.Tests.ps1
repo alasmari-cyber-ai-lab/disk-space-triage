@@ -176,6 +176,8 @@ Describe 'Remove-TriageStore' {
         Test-Path -LiteralPath "$script:Root\good\package-lock.json" | Should -BeTrue
         Test-Path -LiteralPath "$script:Root\nolock\node_modules"    | Should -BeTrue
         $record.Action      | Should -Be 'Recycle'
+        $record.Space       | Should -Match 'Recycle Bin on'
+        $record.After.BinBytes | Should -BeGreaterOrEqual (4096 + 2048) -Because 'what was recycled is still on the drive, in the Recycle Bin'
         $record.StillExists | Should -BeFalse
         @(Import-Csv -LiteralPath $record.LogPath)[-1].OldValue | Should -Be "$script:Root\good\node_modules"
     }
@@ -273,6 +275,8 @@ Describe 'Move-TriageFile' -Skip:$script:NoOtherDrive {
         Test-Path -LiteralPath ($script:Target + '.triage-partial') | Should -BeFalse
         $logged = @(Import-Csv -LiteralPath $record.LogPath)[-1]
         $logged.NewValue | Should -Be $script:Target
-        $logged.Detail   | Should -Be ('SHA256 ' + $script:Hash)
+        $logged.Detail   | Should -BeLike ('SHA256 ' + $script:Hash + '*free*')
+        $record.Space    | Should -Match 'free .+ -> .+'
+        $record.After.BinKnown | Should -BeTrue
     }
 }

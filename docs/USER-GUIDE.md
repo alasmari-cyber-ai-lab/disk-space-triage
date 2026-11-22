@@ -4,36 +4,57 @@ Work through the buckets in this order. Each step is cheaper and safer than
 the next, and may make the next one unnecessary.
 
 1. **Delete** - reproducible things. Read the Why column first: an environment needs its package list exported, and `node_modules` needs a lockfile, before it can be rebuilt.
-2. **Redirect** - change the setting and confirm it took effect. Then deal with the old folder: **delete it only if the Why column calls it a cache or re-downloadable; otherwise move its contents.** Recordings, game worlds, run logs and container data are yours, not caches.
-3. **Move** - copy, verify, then remove the original. The tool does this for plain data files; for anything else, keep the original until you are sure.
+2. **Redirect** - for the stores on the Move caches tab the tool moves the contents and switches the setting in one step. For the others, change the setting yourself and confirm it took effect, then deal with the old folder: **delete it only if the Why column calls it a cache or re-downloadable; otherwise move its contents.** Recordings, game worlds, run logs and container data are yours, not caches.
+3. **Move** - copy, verify, then remove the original, then empty the Recycle Bin. The tool does this for plain data files; for anything else, keep the original until you are sure.
 4. **Administrator checklist** - once, by hand.
 
 Aim for 15 to 20 percent free on the system drive, not for an empty drive.
 
-## Fix with one setting (the tool does it for you)
+## First: where did my space go after I deleted something?
 
-For pure caches the window can make the change itself. On the **Fix with one
-setting** tab, tick **Allow this tool to make these changes**, select a row
-marked Ready, and choose **Apply selected**. The tool creates an empty folder
-on the other drive and sets one user variable; it shows both before you
-confirm.
+Into the Recycle Bin, which is on the same drive. Deleting or moving a file
+does not free anything until the Recycle Bin is emptied. The yellow bar at
+the top of the window always shows how much the Recycle Bin on the drive
+holds and how the free space has changed since you opened the window.
+**Empty Recycle Bin** frees it. That step is permanent and empties your whole
+Recycle Bin on that drive, so look inside first if you are not sure.
 
+No button in the window is greyed out without a reason. If a button cannot
+act, choose it anyway: the line below the buttons tells you what is missing
+(scan first, select a row, or why that row is not possible).
+
+## Move caches (the tool does it for you)
+
+On the **Move caches** tab, select a row whose Status is Ready and choose
+**Move to the other drive**. The tool shows the old folder, the new folder
+and what will happen, and asks.
+
+- Close the program that owns the store first (Python, Ollama, your editor).
+- Every file is copied and compared with its original. The setting is
+  switched and the old folder removed only after all of them match. You can
+  cancel; the copies are then removed again and nothing has changed.
 - The new folder keeps its name and place: `C:\Users\you\.cache\huggingface`
-  becomes `D:\FromC\Users\you\.cache\huggingface`, so its origin stays
-  obvious. If that folder already exists with something in it, the tool
-  refuses and asks you to look first.
-- Nothing is moved or deleted. Close and reopen your terminals and
-  applications (or sign out and in), use the program once, and check that
-  files appear in the new folder.
-- **Then follow what the tool says about the old folder.** For a pure cache
-  (pip, uv, npm, NuGet, Go, Composer) delete it. For Ollama, move the models
-  across: models you created yourself cannot be downloaded again. For Hugging
-  Face, sign in again or copy the `token` file before deleting anything. For
-  Keras, copy `keras.json`.
-- **Undo last change** removes the variable again, until you close the
-  window. Later, remove it yourself under Settings > System > About >
-  Advanced system settings > Environment Variables, "User variables". Every
-  change is listed in `DiskTriage_actions.csv` next to your reports.
+  becomes `D:\FromC\Users\you\.cache\huggingface`. Everything comes along,
+  including the Hugging Face sign-in token and `keras.json`.
+- Close and reopen your terminals and applications (or sign out and in) so
+  they see the new setting.
+- If the old folder is too large for the Recycle Bin, Windows asks whether to
+  delete it permanently. The checked copy exists by then, so you can answer
+  Yes. Otherwise choose **Empty Recycle Bin** afterwards.
+- "Not possible" rows say why. The usual reasons: the store contains links
+  (Hugging Face with Windows Developer Mode), the setting already points
+  somewhere else, or the other drive has too little room.
+- **Only change the setting** changes where new downloads go and moves
+  nothing, so it frees nothing. Use it when you would rather let a cache
+  refill on the other drive and delete the old one yourself. **Undo last
+  setting change** reverses it until you close the window.
+- If you used "Only change the setting" earlier, select the row again and
+  choose **Move to the other drive**: the old files are moved into the folder
+  that is already in use. Nothing there is overwritten.
+- To go back after a move: move the folder back to its old place and delete
+  the variable under Settings > System > About > Advanced system settings >
+  Environment Variables, "User variables". Every change is listed in
+  `DiskTriage_actions.csv` next to your reports.
 - Use this on your own PC. On a shared computer the new folder may be
   readable by other users (see SECURITY.md). The other drive must be an
   internal NTFS disk that stays connected.
@@ -51,7 +72,7 @@ confirm.
   steps are in the Move section below.
 - **An installed program itself** must never be moved. Uninstall it and
   install it again on the other drive.
-- **If something misbehaves after a redirect**, use Undo last change (or
+- **If something misbehaves after "Only change the setting"**, use Undo last setting change (or
   delete the variable in Settings > System > About > Advanced system settings
   > Environment Variables, under "User variables"). If you have not deleted
   the old folder, the program carries on as before; anything it downloaded
@@ -59,10 +80,10 @@ confirm.
 
 ## Delete rebuildable folders (the tool does it for you)
 
-On the **Delete rebuildable folders** tab, tick the box, select a row marked
-Ready, and choose **Send selected to Recycle Bin**. The whole folder goes to
-the Recycle Bin; restore it from there if you change your mind, and empty the
-Recycle Bin to actually free the space.
+On the **Delete** tab, select a row marked Ready and choose **Delete (to
+Recycle Bin)**. The whole folder goes to the Recycle Bin; restore it from
+there if you change your mind, and choose **Empty Recycle Bin** at the top to
+actually free the space.
 
 - Only folders that rebuild or refill by themselves are listed. A row marked
   "Not possible" says why: no lockfile, something foreign inside, a link
@@ -77,8 +98,8 @@ Recycle Bin to actually free the space.
 
 ## Move files to the other drive (the tool does it for you)
 
-On the **Move files to the other drive** tab, tick the box, select a file
-marked Ready, and choose **Move selected file**. The file is copied to
+On the **Move files** tab, select a file marked Ready and choose **Move this
+file**. The file is copied to
 `D:\FromC\<same folders>`, the copy is read back and compared with the
 original, and only then is the original sent to the Recycle Bin.
 
@@ -87,7 +108,7 @@ original, and only then is the original sent to the Recycle Bin.
 - Nothing is overwritten. If a file of that name is already there, the tool
   stops and tells you.
 - Update anything that referred to the old path (a notebook, a config file).
-- Empty the Recycle Bin to free the space on C:.
+- Choose **Empty Recycle Bin** at the top to free the space on C:.
 - Only plain data files outside program folders, `AppData`, hidden tool
   folders and the usual sync folders are listed. Before moving a file, make
   sure no project or program still expects it at the old path and that its

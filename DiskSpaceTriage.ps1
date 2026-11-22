@@ -3,7 +3,8 @@
 .SYNOPSIS
     Disk Space Triage - shows what is filling a Windows system drive and how
     each item can leave it safely. The scan is read-only; changes happen only
-    through three optional, confirmed actions.
+    through four optional, confirmed actions, and each one reports the free
+    space it measured before and after.
 
 .DESCRIPTION
     Every finding is sorted into one of five buckets:
@@ -21,24 +22,35 @@
          elevated unless -AllowElevated is given.
       2. THE SCAN IS READ-ONLY and reads metadata only: names, sizes,
          timestamps and attributes. It never opens a file.
-      3. THREE ACTIONS, each off until you tick its box, each confirmed one
-         item at a time, each logged:
-           Redirect - set a user environment variable from a fixed list and
-                      create the empty folder it points to. Undoable.
+      3. FOUR ACTIONS, each confirmed one item at a time (default answer
+         No), each logged, each followed by the measured free space before
+         and after:
+           Move a store - for a fixed list of caches and model stores: copy
+                      every file to <drive>:\FromC\<same path>, verify each
+                      copy by SHA-256, set the one user environment variable
+                      that tells the owning tool where the store now is, then
+                      send the old folder to the Recycle Bin. (Setting the
+                      variable alone is also offered, and is undoable.)
            Delete   - send one rebuildable store folder (from a short list)
                       to the Recycle Bin.
-           Move     - copy one plain data file to <drive>:\FromC\<same path>,
-                      verify the copy by SHA-256, then send the original to
-                      the Recycle Bin. This is the only time a file's contents
-                      are read.
-         Nothing is ever deleted permanently and nothing is overwritten.
+           Move a file - copy one plain data file to <drive>:\FromC\<same
+                      path>, verify the copy by SHA-256, then send the
+                      original to the Recycle Bin.
+           Empty the Recycle Bin - of the one drive being freed. The Recycle
+                      Bin of a drive is on that drive, so this is the step
+                      that returns the space. It is the only permanent
+                      removal the tool can ask Windows for, and it says so.
+         File contents are read only while copying. Nothing is overwritten,
+         and apart from emptying the Recycle Bin the script deletes nothing
+         permanently except its own unfinished copies.
       4. NO NETWORK. No download, upload, telemetry or remoting. The HTML
          report is self-contained and carries a Content-Security-Policy that
          blocks every external request.
       5. NO HIDDEN CODE. No Invoke-Expression, no compiled C#, no reflection,
          no COM, no external processes. Two Add-Type calls load assemblies
          that ship with Windows (WPF, and the Visual Basic runtime used to
-         reach the Recycle Bin).
+         reach the Recycle Bin). One registry value is read (whether Windows
+         apps use the dark theme); none is written.
       6. CONTAINED WRITES. Reports and the action log go to one folder on a
          local fixed disk. Folders and moved files are created only below
          <drive>:\FromC. UNC paths, network drives and junctions are refused.
@@ -55,7 +67,7 @@
 
 .PARAMETER DestinationDrive
     Drive letter you intend to relocate to. The scan only checks its capacity;
-    confirmed redirects create empty folders below <drive>:\FromC on it.
+    confirmed moves create folders and files below <drive>:\FromC on it.
 
 .PARAMETER MinSizeMB
     Smallest individual file listed. Smaller files still count in all totals.
@@ -104,13 +116,20 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:TriageVersion = '1.0.0'
+$script:TriageVersion = '1.1.0'
 $script:TriageCancel  = $false
 $script:TriageUi      = $null
 $script:TriageLastResult = $null
 $script:TriageRedirectPlan    = @()
 $script:TriageRedirectHistory = $null
 $script:TriageScanning        = $false
+$script:TriageBusy            = $false
+$script:TriageSession         = $null
+$script:TriageSessionStart    = $null
+$script:TriageSpaceNow        = $null
+$script:TriageDeletePlan      = @()
+$script:TriageMovePlan        = @()
+$script:TriageMoveTicks       = 0
 $script:TriageGuiRoots       = @($AdditionalRoot)
 $script:TriageGuiSkipDefault = [bool]$SkipDefaultRoots
 $script:TriageGuiReportDir   = $ReportDirectory
@@ -1041,11 +1060,14 @@ function Export-TriageReport {
 }
 
 #region Actions --------------------------------------------------------------
-# Redirect: after the user enables it and confirms each change, the tool can
-#   1. create an empty folder on the destination drive, and
-#   2. set (or restore) a user-level environment variable from the list below.
-# Redirect moves and deletes nothing: the old folder stays where it is until
-# the user deals with it. Every change is written to the action log.
+# Redirect: after the user confirms each change, the tool can
+#   1. create a folder on the destination drive,
+#   2. set (or restore) a user-level environment variable from the list below,
+#   3. optionally (Move-TriageStore) copy the existing contents across first,
+#      verify every file by SHA-256, and then ask Windows to put the old
+#      folder in the Recycle Bin.
+# Set-TriageRedirect alone moves and deletes nothing. Every change is written
+# to the action log.
 
 function New-TriageRedirectTarget {
     param([string]$Variable, [string]$Mechanism, [string]$RelativePath, [string]$Effect, [string]$OldFolder)
@@ -1073,6 +1095,14 @@ $script:TriageRedirectTargets = @(
     New-TriageRedirectTarget 'NLTK_DATA'          'NLTK_DATA'            'AppData\Roaming\nltk_data' 'New corpus downloads go to the new folder. Corpora already in the old folder keep working while it exists.' 'Keep the old folder, or move its contents into the new one before deleting it.'
     New-TriageRedirectTarget 'OLLAMA_MODELS'      'OLLAMA_MODELS'        '.ollama\models'           'Quit Ollama from the system tray and start it again. It will then look for models only in the new folder.' 'Do NOT delete the old folder: move its contents into the new one. Models you created or imported yourself cannot be downloaded again.'
 )
+
+# Stores that hold nothing but downloads the owning tool fetches again. Only
+# for these may a file that already exists in the new folder win over a
+# different old one when the old contents are moved across.
+$script:TriagePureCaches = @{
+    'PIP_CACHE_DIR' = $true; 'UV_CACHE_DIR' = $true; 'npm_config_cache' = $true; 'NUGET_PACKAGES' = $true
+    'GOMODCACHE' = $true; 'COMPOSER_CACHE_DIR' = $true; 'TRITON_CACHE_DIR' = $true
+}
 
 function Get-TriageProfileName {
     if (-not $env:USERPROFILE) { return '' }
@@ -1183,6 +1213,23 @@ function Get-TriageRedirectPlan {
             }
         }
 
+        # Can the files that are on the source drive now be moved across as well?
+        $moveState  = 'Blocked'
+        $moveReason = $reason
+        $room       = ($null -ne $destination -and $destination.FreeBytes -ge ($bytes + 1GB))
+        if ($state -eq 'Ready') {
+            $moveState = 'Ready'; $moveReason = ''
+        } elseif ($state -eq 'AlreadySet') {
+            if ($current.TrimEnd('\') -ieq $proposed -and (Test-Path -LiteralPath $source -PathType Container)) {
+                $moveState = 'Ready'; $moveReason = 'the setting is already switched; only the old files still have to move'
+            } else {
+                $moveReason = 'The variable points at a folder this tool did not choose. Move the old files yourself.'
+            }
+        }
+        if ($moveState -eq 'Ready' -and -not $room) {
+            $moveState = 'Blocked'; $moveReason = 'Not enough free space on the destination for the files that are there now.'
+        }
+
         [pscustomobject]@{
             Variable      = $target.Variable
             SizeBytes     = $bytes
@@ -1193,6 +1240,8 @@ function Get-TriageRedirectPlan {
             OldFolder     = $target.OldFolder
             State         = $state
             Reason        = $reason
+            MoveState     = $moveState
+            MoveReason    = $moveReason
         }
     }
     return @($plan)
@@ -1214,9 +1263,10 @@ function Set-TriageRedirect {
         Applies one plan item: creates the empty folder and sets the user
         variable. Re-validates everything first; a stale or edited plan item
         cannot widen what this function does. Returns the record needed to
-        undo the change.
+        undo the change. -Populated is passed only by Move-TriageStore, after
+        it has filled the (previously empty) folder with verified copies.
     #>
-    param([Parameter(Mandatory)] $Item, [string]$LogDirectory)
+    param([Parameter(Mandatory)] $Item, [string]$LogDirectory, [switch]$Populated)
 
     $target = $script:TriageRedirectTargets | Where-Object { $_.Variable -ceq [string]$Item.Variable }
     if ($null -eq $target) { throw "Not a variable this tool manages: $($Item.Variable)" }
@@ -1233,7 +1283,7 @@ function Set-TriageRedirect {
     $driveProblem = Test-TriageRedirectDrive -Letter $letter
     if ($driveProblem -ne '') { throw "Refused: $driveProblem" }
     if (Test-TriageLinkInPath -Path $value) { throw "Refused: the new folder would sit below a junction or symbolic link: $value" }
-    if (-not (Test-TriageFolderEmpty -Path $value)) { throw "Refused: the new folder already exists and is not empty: $value" }
+    if (-not $Populated -and -not (Test-TriageFolderEmpty -Path $value)) { throw "Refused: the new folder already exists and is not empty: $value" }
 
     $old = [string][Environment]::GetEnvironmentVariable($target.Variable, 'User')
     if (-not [string]::IsNullOrEmpty($old)) { throw "Refused: $($target.Variable) is already set to $old. Nothing was changed." }
@@ -1453,6 +1503,7 @@ function Remove-TriageStore {
 
     $logTarget = Resolve-ReportDirectory -Requested $LogDirectory
     Initialize-TriageRecycleBin
+    $before = Get-TriageSpaceSnapshot -Letter $path.Substring(0, 1)
 
     $failure = ''
     try {
@@ -1466,15 +1517,21 @@ function Remove-TriageStore {
 
     $action = 'Recycle'
     if ($still) { $action = 'Recycle (not completed)' }
+    $after = Get-TriageSpaceSnapshot -Letter $path.Substring(0, 1)
+    $space = Format-TriageSpaceChange -Before $before -After $after
     $record = [pscustomobject]@{
         When        = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture)
         Action      = $action
         Variable    = ''
         OldValue    = $path
         NewValue    = 'Recycle Bin'
-        Detail      = $failure
+        Detail      = ($failure + ' ' + $space).Trim()
         LogPath     = ''
         StillExists = [bool]$still
+        SizeBytes   = [long]$check[0].SizeBytes
+        Before      = $before
+        After       = $after
+        Space       = $space
     }
     try { $record.LogPath = Write-TriageActionLog -Record $record -Directory $logTarget } catch { $record.LogPath = '' }
     return $record
@@ -1615,13 +1672,12 @@ function Get-TriageFileHash {
 
 function Move-TriageFile {
     <#
-        Moves ONE plain data file. The copy is written under a temporary name
-        (<target>.triage-partial), re-read and compared with the original by
-        SHA-256, and only then given its final name. The original is held
-        open, so nothing can change it, until the comparison is done; then
-        Windows is asked to put it in the Recycle Bin. Never overwrites. If
-        anything fails or the user cancels, the temporary copy is removed and
-        the original is untouched.
+        Moves ONE plain data file. Copy-TriageVerifiedFile writes the copy
+        under a temporary name, compares it with the original by SHA-256 and
+        only then gives it its final name; after that Windows is asked to put
+        the original in the Recycle Bin. Never overwrites. If anything fails
+        or the user cancels, the temporary copy is removed and the original is
+        untouched.
     #>
     param([Parameter(Mandatory)] $Item, [string]$LogDirectory, [scriptblock]$OnProgress)
 
@@ -1666,12 +1722,177 @@ function Move-TriageFile {
     if (-not (Test-Path -LiteralPath $folder)) { New-Item -ItemType Directory -Path $folder -Force | Out-Null }
 
     $script:TriageCancel = $false
+    $before     = Get-TriageSpaceSnapshot -Letter $source.Substring(0, 1)
+    $sourceHash = Copy-TriageVerifiedFile -Source $source -Partial $partial -Destination $destination -Size $size -Stamp $info.LastWriteTimeUtc -BaseBytes 0 -TotalBytes $size -OnProgress $OnProgress
+
+    # The original must be exactly what was copied, or it stays.
+    $recheck = Get-Item -LiteralPath $source -Force
+    if ($recheck.Length -ne $size -or $recheck.LastWriteTimeUtc -ne $info.LastWriteTimeUtc) {
+        throw "The original changed after it was copied, so it was left in place. A verified copy of the earlier contents is at $destination."
+    }
+
+    $failure = ''
+    try {
+        [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($source, [Microsoft.VisualBasic.FileIO.UIOption]::AllDialogs, [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin, [Microsoft.VisualBasic.FileIO.UICancelOption]::ThrowException)
+    } catch { $failure = $_.Exception.Message }
+    $recycled = -not (Test-Path -LiteralPath $source)
+
+    $action = 'Move'
+    if (-not $recycled) { $action = 'Copy (original kept)' }
+    $after = Get-TriageSpaceSnapshot -Letter $source.Substring(0, 1)
+    $space = Format-TriageSpaceChange -Before $before -After $after
+    $record = [pscustomobject]@{
+        When     = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture)
+        Action   = $action
+        Variable = ''
+        OldValue = $source
+        NewValue = $destination
+        Detail   = ('SHA256 ' + $sourceHash.Replace('-', '') + ' ' + $failure + ' ' + $space).Replace('  ', ' ').Trim()
+        LogPath  = ''
+        OriginalRecycled = [bool]$recycled
+        Sha256   = $sourceHash.Replace('-', '')
+        SizeBytes = $size
+        Before   = $before
+        After    = $after
+        Space    = $space
+    }
+    try { $record.LogPath = Write-TriageActionLog -Record $record -Directory $logTarget } catch { $record.LogPath = '' }
+    return $record
+}
+#endregion
+
+#region Free space, Recycle Bin and moving a whole store ----------------------
+# Why this exists: Delete and Move put originals in the Recycle Bin, and the
+# Recycle Bin of a drive is ON that drive. Nothing is freed until it is
+# emptied. So every action measures the free space before and after, the
+# window always shows what the Recycle Bin holds, and emptying it is an
+# explicit, separately confirmed step - the only permanent removal the tool
+# can ask Windows for.
+
+function Get-TriageRecycleBinInfo {
+    <#
+        Read-only. What the current user has in the Recycle Bin of one drive,
+        taken from the bin's own index records (one small $I file per item,
+        with the item's size at byte 8). Opens none of the user's files.
+    #>
+    param([string]$Letter)
+    $info = [pscustomobject]@{ Letter = $Letter.ToUpper(); Items = 0; Bytes = [long]0; Known = $false }
+    try {
+        $sid = [string][Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $bin = ('{0}:\$Recycle.Bin\{1}' -f $Letter.ToUpper(), $sid)
+        if (-not (Test-Path -LiteralPath $bin -PathType Container)) { $info.Known = $true; return $info }
+        $folder = New-Object System.IO.DirectoryInfo $bin
+        $buffer = New-Object byte[] 16
+        foreach ($entry in $folder.EnumerateFiles('$I*')) {
+            $read   = 0
+            $stream = [System.IO.File]::OpenRead($entry.FullName)
+            try { $read = $stream.Read($buffer, 0, 16) } finally { $stream.Dispose() }
+            if ($read -lt 16) { continue }
+            $size = [System.BitConverter]::ToInt64($buffer, 8)
+            if ($size -lt 0) { continue }
+            $info.Items = $info.Items + 1
+            $info.Bytes = $info.Bytes + $size
+        }
+        $info.Known = $true
+    } catch { $info.Known = $false }
+    return $info
+}
+
+function Get-TriageSpaceSnapshot {
+    # Free bytes of a drive (the figure Windows reports to the current user)
+    # and the contents of its Recycle Bin, at this moment.
+    param([string]$Letter)
+    $facts = Get-DriveFacts -Letter $Letter
+    $bin   = Get-TriageRecycleBinInfo -Letter $Letter
+    $free  = [long]-1
+    if ($null -ne $facts) { $free = [long]$facts.FreeBytes }
+    return [pscustomobject]@{
+        Letter    = $Letter.ToUpper()
+        FreeBytes = $free
+        BinBytes  = [long]$bin.Bytes
+        BinItems  = [int]$bin.Items
+        BinKnown  = [bool]$bin.Known
+    }
+}
+
+function Format-TriageSpaceChange {
+    # 'C: free 10.00 GB -> 12.10 GB (+2.10 GB). Recycle Bin on C: holds 0 KB.'
+    param($Before, $After)
+    if ($null -eq $Before -or $null -eq $After -or $Before.FreeBytes -lt 0 -or $After.FreeBytes -lt 0) { return '' }
+    $delta = [double]($After.FreeBytes - $Before.FreeBytes)
+    $sign  = '+'
+    if ($delta -lt 0) { $sign = '-'; $delta = -$delta }
+    $text = ('{0}: free {1} -> {2} ({3}{4}).' -f $After.Letter, (Format-Size -Bytes ([double]$Before.FreeBytes)), (Format-Size -Bytes ([double]$After.FreeBytes)), $sign, (Format-Size -Bytes $delta))
+    if ($After.BinKnown) {
+        $text = $text + (' Recycle Bin on {0}: holds {1}.' -f $After.Letter, (Format-Size -Bytes ([double]$After.BinBytes)))
+    }
+    return $text
+}
+
+function Clear-TriageRecycleBin {
+    <#
+        The explicit "free the space now" step: asks Windows to empty the
+        current user's Recycle Bin on ONE local fixed drive. This is permanent
+        and covers everything in that bin, not only what this tool put there;
+        the window says so and asks first. Returns a record with the free
+        space measured before and after.
+    #>
+    param([string]$Letter, [string]$LogDirectory)
+
+    if ($Letter -notmatch '^[A-Za-z]$') { throw "Refused: not a drive letter: $Letter" }
+    $drive = $Letter.ToUpper()
+    $facts = Get-DriveFacts -Letter $drive
+    if ($null -eq $facts -or $facts.Type -ne 'Fixed') { throw "Refused: $drive is not a local fixed disk." }
+
+    $before = Get-TriageSpaceSnapshot -Letter $drive
+    if (-not $before.BinKnown) { throw "The Recycle Bin on $drive could not be read, so its contents are not known. Empty it from the desktop instead." }
+    $logTarget = Resolve-ReportDirectory -Requested $LogDirectory
+
+    $failure = ''
+    if ($before.BinItems -gt 0) {
+        try { Clear-RecycleBin -DriveLetter $drive -Force -ErrorAction Stop } catch { $failure = $_.Exception.Message }
+    }
+    $after = Get-TriageSpaceSnapshot -Letter $drive
+    $space = Format-TriageSpaceChange -Before $before -After $after
+
+    $action = 'Empty Recycle Bin'
+    if ($after.BinItems -gt 0) { $action = 'Empty Recycle Bin (not completed)' }
+    $record = [pscustomobject]@{
+        When      = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture)
+        Action    = $action
+        Variable  = ''
+        OldValue  = ('{0} item(s), {1}' -f $before.BinItems, (Format-Size -Bytes ([double]$before.BinBytes)))
+        NewValue  = ('{0} item(s)' -f $after.BinItems)
+        Detail    = ($failure + ' ' + $space).Trim()
+        LogPath   = ''
+        SizeBytes = [long]$before.BinBytes
+        Before    = $before
+        After     = $after
+        Space     = $space
+        Failure   = $failure
+    }
+    try { $record.LogPath = Write-TriageActionLog -Record $record -Directory $logTarget } catch { $record.LogPath = '' }
+    return $record
+}
+
+function Copy-TriageVerifiedFile {
+    <#
+        Copies ONE file. The copy is written as a NEW file under a temporary
+        name ($Partial), hashed while it is written, read back and compared
+        with the original by SHA-256, and only then given its final name
+        ($Destination, which must not exist). The original is held open, so
+        nothing can change it, until the comparison is done. If anything
+        fails or the user cancels, the temporary copy is deleted - the only
+        file this script ever deletes permanently besides copies rolled back
+        by Undo-TriageStoreCopy. Returns the SHA-256 of the file.
+    #>
+    param([string]$Source, [string]$Partial, [string]$Destination, [long]$Size, [datetime]$Stamp,
+          [long]$BaseBytes, [long]$TotalBytes, [scriptblock]$OnProgress)
+
     $created    = $false
     $finished   = $false
     $sourceHash = ''
-    # The original stays open (readable, but not writable by anyone) from the
-    # first byte copied until the copy has been compared with it.
-    $in = [System.IO.File]::OpenRead($source)
+    $in = [System.IO.File]::OpenRead($Source)
     try {
         $sha    = [System.Security.Cryptography.SHA256]::Create()
         $buffer = New-Object byte[] 4194304
@@ -1685,8 +1906,8 @@ function Move-TriageFile {
                 $out.Write($buffer, 0, $read)
                 [void]$sha.TransformBlock($buffer, 0, $read, $null, 0)
                 $done += $read
-                if ($null -ne $OnProgress) { & $OnProgress 'Copying' $done $size }
-                if ($script:TriageCancel) { throw 'Cancelled. The original file was not touched.' }
+                if ($null -ne $OnProgress) { & $OnProgress 'Copying' ($BaseBytes + $done) $TotalBytes }
+                if ($script:TriageCancel) { throw 'Cancelled. Nothing was removed.' }
             }
             $out.Flush($true)
         }
@@ -1695,12 +1916,15 @@ function Move-TriageFile {
         $sourceHash = [System.BitConverter]::ToString($sha.Hash)
         $sha.Dispose()
 
-        if ($done -ne $size -or $in.Length -ne $size) { throw 'The file changed while it was being copied. The original was not touched.' }
-        $copyHash = Get-TriageFileHash -Path $partial -OnProgress $OnProgress -Stage 'Verifying'
-        if ($null -eq $copyHash) { throw 'Cancelled. The original file was not touched.' }
-        if ($copyHash -cne $sourceHash) { throw 'The copy does not match the original. The original was not touched.' }
+        if ($done -ne $Size -or $in.Length -ne $Size) { throw 'The file changed while it was being copied. Nothing was removed.' }
+        # One file: show the read-back. Many files: keep the overall figure steady.
+        $verifyProgress = $null
+        if ($TotalBytes -eq $Size) { $verifyProgress = $OnProgress }
+        $copyHash = Get-TriageFileHash -Path $partial -OnProgress $verifyProgress -Stage 'Verifying'
+        if ($null -eq $copyHash) { throw 'Cancelled. Nothing was removed.' }
+        if ($copyHash -cne $sourceHash) { throw 'The copy does not match the original. Nothing was removed.' }
 
-        [System.IO.File]::SetLastWriteTimeUtc($partial, $info.LastWriteTimeUtc)
+        [System.IO.File]::SetLastWriteTimeUtc($partial, $Stamp)
         # Only a verified copy ever gets the real name. Move fails if the name is taken.
         [System.IO.File]::Move($partial, $destination)
         $finished = $true
@@ -1712,34 +1936,240 @@ function Move-TriageFile {
             try { [System.IO.File]::Delete($partial) } catch { Write-Warning "Could not remove the temporary copy: $partial" }
         }
     }
+    return $sourceHash
+}
 
-    # The original must be exactly what was copied, or it stays.
-    $after = Get-Item -LiteralPath $source -Force
-    if ($after.Length -ne $size -or $after.LastWriteTimeUtc -ne $info.LastWriteTimeUtc) {
-        throw "The original changed after it was copied, so it was left in place. A verified copy of the earlier contents is at $destination."
+function Get-TriageStoreInventory {
+    <#
+        Read-only. Every folder and file below a store folder, for copying.
+        Throws when the store holds anything the tool will not copy blindly:
+        a junction, symbolic link or cloud placeholder, or an entry that
+        cannot be read.
+    #>
+    param([string]$Root)
+    $folders = New-Object 'System.Collections.Generic.List[string]'
+    $files   = New-Object 'System.Collections.Generic.List[object]'
+    $bytes   = [long]0
+    $newest  = [long]0
+    $queue   = New-Object 'System.Collections.Generic.Queue[object]'
+    $queue.Enqueue($Root)
+    while ($queue.Count -gt 0) {
+        if ($script:TriageCancel) { throw 'Cancelled. Nothing was changed.' }
+        $info = New-Object System.IO.DirectoryInfo ([string]$queue.Dequeue())
+        foreach ($entry in $info.EnumerateFileSystemInfos()) {
+            # ReparsePoint, Offline, RecallOnDataAccess
+            if (([int]$entry.Attributes -band 0x401400) -ne 0) { throw "it contains a link or a cloud placeholder ($($entry.FullName))" }
+            if ($entry.Attributes -band [System.IO.FileAttributes]::Directory) {
+                $folders.Add($entry.FullName)
+                $queue.Enqueue($entry.FullName)
+            } else {
+                $files.Add([pscustomobject]@{ Path = $entry.FullName; Length = [long]$entry.Length; Stamp = $entry.LastWriteTimeUtc })
+                $bytes = $bytes + [long]$entry.Length
+                if ($entry.LastWriteTimeUtc.Ticks -gt $newest) { $newest = $entry.LastWriteTimeUtc.Ticks }
+            }
+        }
+    }
+    return [pscustomobject]@{ Folders = $folders; Files = $files; Bytes = $bytes; Newest = $newest }
+}
+
+function Undo-TriageStoreCopy {
+    <#
+        Rolls back a store copy that did not finish: deletes exactly the
+        files the copy created (the caller's list) and then the folders it
+        created, deepest first and only if they are empty. Everything must be
+        below the one new folder for that store; the original is not touched.
+    #>
+    param([string]$Root, $Files, $Folders)
+    if ($Root -notmatch '^[A-Za-z]:\\FromC\\Users\\[^\\]+\\[^\\]') { return }
+    foreach ($created in @($Files)) {
+        if (-not ([string]$created).StartsWith($Root + '\', [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+        try { [System.IO.File]::Delete($created) } catch { Write-Warning "Could not remove the unfinished copy: $created" }
+    }
+    foreach ($made in @($Folders | Sort-Object -Property Length -Descending)) {
+        if (([string]$made) -ne $Root -and -not ([string]$made).StartsWith($Root + '\', [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+        # One argument: removes the folder only if it is empty.
+        try { [System.IO.Directory]::Delete($made) } catch { Write-Verbose "Left in place (not empty): $made" }
+    }
+}
+
+function Move-TriageStore {
+    <#
+        Redirect one store AND bring its existing contents along, so the
+        space on the source drive really comes back:
+          1. every file is copied to the new folder and verified by SHA-256
+             (Copy-TriageVerifiedFile); nothing is overwritten;
+          2. the old folder is listed again and must be unchanged;
+          3. the user variable is set (Set-TriageRedirect), unless this tool
+             already set it earlier;
+          4. Windows is asked to put the old folder in the Recycle Bin.
+        If anything fails before step 3, the copies made so far are removed
+        again and nothing else has changed. Everything is re-validated here,
+        so a stale or edited plan item cannot widen what happens.
+    #>
+    param([Parameter(Mandatory)] $Item, [string]$LogDirectory, [scriptblock]$OnProgress)
+
+    if (-not (Test-TriageInteractive)) { throw 'Refused: there is no interactive desktop, so Windows could not use the Recycle Bin.' }
+
+    $target = $script:TriageRedirectTargets | Where-Object { $_.Variable -ceq [string]$Item.Variable }
+    if ($null -eq $target) { throw "Not a variable this tool manages: $($Item.Variable)" }
+
+    $shown = [string]$Item.ProposedValue
+    if ($shown -notmatch '^[A-Za-z]:\\') { throw "Refused: not a full local path: $shown" }
+    $drive = $shown.Substring(0, 1)
+    $value = Get-TriageRedirectFolder -Letter $drive -Target $target
+    if ($shown -cne $value) { throw "Refused: the new folder must be exactly $value. Got: $shown" }
+    $driveProblem = Test-TriageRedirectDrive -Letter $drive
+    if ($driveProblem -ne '') { throw "Refused: $driveProblem" }
+    if (Test-TriageLinkInPath -Path $value) { throw "Refused: the new folder would sit below a junction or symbolic link: $value" }
+
+    # The old folder is never taken from the caller: it is the store's one usual place.
+    $source = Join-Path ([string]$env:USERPROFILE) $target.RelativePath
+    if ([string]::IsNullOrEmpty($env:USERPROFILE) -or [System.IO.Path]::GetFullPath($source) -cne $source) { throw 'Refused: your user profile folder could not be determined.' }
+    if (-not (Test-Path -LiteralPath $source -PathType Container)) { throw "Refused: the old folder no longer exists: $source" }
+    if ($source.Substring(0, 1).ToUpper() -eq $drive.ToUpper()) { throw 'Refused: the old folder is already on the destination drive.' }
+    if (Test-TriageLinkInPath -Path $source) { throw "Refused: the old folder is, or is below, a junction or symbolic link: $source" }
+    $sourceFacts = Get-DriveFacts -Letter $source.Substring(0, 1)
+    if ($null -eq $sourceFacts -or $sourceFacts.Type -ne 'Fixed') { throw "Refused: not on a local fixed disk: $source" }
+
+    $machine = [string][Environment]::GetEnvironmentVariable($target.Variable, 'Machine')
+    if (-not [string]::IsNullOrEmpty($machine)) { throw "Refused: $($target.Variable) is set for the whole computer. Nothing was changed." }
+    $current = [string][Environment]::GetEnvironmentVariable($target.Variable, 'User')
+    # Merge: the variable already points at the tool's folder (an earlier
+    # setting-only redirect), so that folder is in use and may hold files.
+    $merge = $false
+    if (-not [string]::IsNullOrEmpty($current)) {
+        if ($current.TrimEnd('\') -ine $value) { throw "Refused: $($target.Variable) is already set to $current, which is not the folder this tool would use. Nothing was changed." }
+        $merge = $true
+    } elseif (-not (Test-TriageFolderEmpty -Path $value)) {
+        throw "Refused: the new folder already exists and is not empty: $value"
+    }
+
+    $script:TriageCancel = $false
+    $inventory = $null
+    try { $inventory = Get-TriageStoreInventory -Root $source } catch { throw "Refused: the old folder cannot be moved by the tool because $($_.Exception.Message)" }
+    foreach ($file in $inventory.Files) {
+        if (($value.Length + $file.Path.Length - $source.Length) -gt 240) { throw 'Refused: a path in the new folder would be too long for Windows.' }
+    }
+    $destFacts = Get-DriveFacts -Letter $drive
+    if ($destFacts.FreeBytes -lt ($inventory.Bytes + 1GB)) { throw 'Refused: not enough free space on the destination.' }
+
+    $logTarget = Resolve-ReportDirectory -Requested $LogDirectory
+    Initialize-TriageRecycleBin
+    $before = Get-TriageSpaceSnapshot -Letter $source.Substring(0, 1)
+
+    $createdFiles   = New-Object 'System.Collections.Generic.List[string]'
+    $createdFolders = New-Object 'System.Collections.Generic.List[string]'
+    $copied = 0; $same = 0; $kept = 0
+    $doneBytes = [long]0
+    $ok = $false
+    try {
+        $wanted = New-Object 'System.Collections.Generic.List[string]'
+        $wanted.Add($value)
+        foreach ($sub in $inventory.Folders) { $wanted.Add($value + ([string]$sub).Substring($source.Length)) }
+        foreach ($folder in $wanted) {
+            if (Test-Path -LiteralPath $folder -PathType Leaf) { throw "A file is in the way of a folder: $folder" }
+            if (Test-Path -LiteralPath $folder) {
+                if ((Get-Item -LiteralPath $folder -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) { throw "A link is in the way in the new folder: $folder" }
+                continue
+            }
+            New-Item -ItemType Directory -Path $folder -Force | Out-Null
+            $createdFolders.Add($folder)
+        }
+
+        foreach ($file in $inventory.Files) {
+            if ($script:TriageCancel) { throw 'Cancelled. Nothing was removed.' }
+            $destination = $value + $file.Path.Substring($source.Length)
+            if (Test-Path -LiteralPath $destination) {
+                # Possible only when merging into a folder that is already in use.
+                $hashOld = Get-TriageFileHash -Path $file.Path -OnProgress $null -Stage ''
+                $hashNew = Get-TriageFileHash -Path $destination -OnProgress $null -Stage ''
+                if ($null -eq $hashOld -or $null -eq $hashNew) { throw 'Cancelled. Nothing was removed.' }
+                if ($hashOld -ceq $hashNew) { $same = $same + 1 }
+                elseif ($script:TriagePureCaches.ContainsKey($target.Variable)) { $kept = $kept + 1 }
+                else { throw "The old and the new folder both hold '$($file.Path.Substring($source.Length + 1))' with different contents. Nothing was removed; decide which one to keep, then try again." }
+            } else {
+                $partial = $destination + '.triage-partial'
+                if (Test-Path -LiteralPath $partial) { throw "A leftover from an interrupted copy exists. Delete it first: $partial" }
+                [void](Copy-TriageVerifiedFile -Source $file.Path -Partial $partial -Destination $destination -Size $file.Length -Stamp $file.Stamp -BaseBytes $doneBytes -TotalBytes $inventory.Bytes -OnProgress $OnProgress)
+                $createdFiles.Add($destination)
+                $copied = $copied + 1
+            }
+            $doneBytes = $doneBytes + $file.Length
+        }
+
+        # The old folder must still be exactly what was copied.
+        $again = Get-TriageStoreInventory -Root $source
+        if ($again.Files.Count -ne $inventory.Files.Count -or $again.Bytes -ne $inventory.Bytes -or $again.Newest -ne $inventory.Newest) {
+            throw 'The old folder changed while it was being copied. Close the application that uses it, then try again. Nothing was removed.'
+        }
+
+        if (-not $merge) { [void](Set-TriageRedirect -Item $Item -LogDirectory $logTarget -Populated) }
+        $ok = $true
+    }
+    finally {
+        # A fresh copy that did not finish is taken away again. When merging,
+        # verified additions to a folder already in use are left: they are
+        # complete files and a second run skips them.
+        if (-not $ok -and -not $merge) { Undo-TriageStoreCopy -Root $value -Files $createdFiles -Folders $createdFolders }
     }
 
     $failure = ''
     try {
-        [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($source, [Microsoft.VisualBasic.FileIO.UIOption]::AllDialogs, [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin, [Microsoft.VisualBasic.FileIO.UICancelOption]::ThrowException)
+        [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($source, [Microsoft.VisualBasic.FileIO.UIOption]::AllDialogs, [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin, [Microsoft.VisualBasic.FileIO.UICancelOption]::ThrowException)
     } catch { $failure = $_.Exception.Message }
     $recycled = -not (Test-Path -LiteralPath $source)
 
-    $action = 'Move'
-    if (-not $recycled) { $action = 'Copy (original kept)' }
+    $after  = Get-TriageSpaceSnapshot -Letter $source.Substring(0, 1)
+    $space  = Format-TriageSpaceChange -Before $before -After $after
+    $action = 'Move store'
+    if (-not $recycled) { $action = 'Move store (old folder kept)' }
+    $counts = ('{0} file(s) copied and verified, {1} already there, {2} kept as found in the new folder.' -f $copied, $same, $kept)
     $record = [pscustomobject]@{
         When     = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture)
         Action   = $action
-        Variable = ''
+        Variable = $target.Variable
         OldValue = $source
-        NewValue = $destination
-        Detail   = 'SHA256 ' + $sourceHash.Replace('-', '')
+        NewValue = $value
+        Detail   = ($counts + ' ' + $failure + ' ' + $space).Replace('  ', ' ').Trim()
         LogPath  = ''
         OriginalRecycled = [bool]$recycled
-        Sha256   = $sourceHash.Replace('-', '')
+        Copied   = $copied
+        Same     = $same
+        Kept     = $kept
+        SizeBytes = [long]$inventory.Bytes
+        Before   = $before
+        After    = $after
+        Space    = $space
     }
     try { $record.LogPath = Write-TriageActionLog -Record $record -Directory $logTarget } catch { $record.LogPath = '' }
     return $record
+}
+
+function Get-TriageSessionSummary {
+    <#
+        Plain text for sharing or for a bug report: what was done in this
+        session and what it did to the free space. Contains sizes and counts
+        only - no file names, folder names, user name or computer name.
+    #>
+    param($Start, $Now, $Records)
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    $lines.Add('Disk Space Triage ' + $script:TriageVersion + ' - session summary (no paths or names)')
+    $lines.Add('Windows: ' + [string][Environment]::OSVersion.Version)
+    if ($null -ne $Start -and $null -ne $Now -and $Start.FreeBytes -ge 0 -and $Now.FreeBytes -ge 0) {
+        $lines.Add(('Drive {0}: free at start {1}, free now {2}' -f $Now.Letter, (Format-Size -Bytes ([double]$Start.FreeBytes)), (Format-Size -Bytes ([double]$Now.FreeBytes))))
+        $lines.Add(('Recycle Bin on {0}: now {1} in {2} item(s) - not free until emptied' -f $Now.Letter, (Format-Size -Bytes ([double]$Now.BinBytes)), $Now.BinItems))
+    }
+    $n = 0
+    foreach ($r in @($Records)) {
+        $n = $n + 1
+        $free = ''
+        if ($null -ne $r.Before -and $null -ne $r.After) {
+            $free = (' | free {0} -> {1}' -f (Format-Size -Bytes ([double]$r.Before.FreeBytes)), (Format-Size -Bytes ([double]$r.After.FreeBytes)))
+        }
+        $lines.Add(('{0}. {1} | {2}{3}' -f $n, [string]$r.Action, (Format-Size -Bytes ([double]$r.SizeBytes)), $free))
+    }
+    if ($n -eq 0) { $lines.Add('No action was carried out in this session.') }
+    return ($lines -join "`r`n")
 }
 #endregion
 
@@ -2254,28 +2684,47 @@ $script:TriageXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Disk Space Triage"
-        Width="1100" Height="700" MinWidth="940" MinHeight="560"
+        Width="1100" Height="700" MinWidth="960" MinHeight="600"
         WindowStartupLocation="CenterScreen"
-        Background="#EDF1F3"
-        FontFamily="Segoe UI" FontSize="13"
+        Background="@Bg@" Foreground="@Ink@"
+        FontFamily="Segoe UI Variable Text, Segoe UI" FontSize="13"
+        TextOptions.TextFormattingMode="Display"
         UseLayoutRounding="True" SnapsToDevicePixels="True">
   <Window.Resources>
-    <SolidColorBrush x:Key="BgBrush" Color="#EDF1F3"/>
-    <SolidColorBrush x:Key="SurfaceBrush" Color="#FFFFFF"/>
-    <SolidColorBrush x:Key="InkBrush" Color="#17262F"/>
-    <SolidColorBrush x:Key="MutedBrush" Color="#4F5D68"/>
-    <SolidColorBrush x:Key="LineBrush" Color="#D3DBE0"/>
-    <SolidColorBrush x:Key="HeaderBrush" Color="#EAEFF2"/>
-    <SolidColorBrush x:Key="TrackBrush" Color="#DDE4E8"/>
-    <SolidColorBrush x:Key="BandBrush" Color="#12303B"/>
-    <SolidColorBrush x:Key="AccentBrush" Color="#0E6B7C"/>
-    <SolidColorBrush x:Key="RedirectBrush" Color="#0E6B7C"/>
-    <SolidColorBrush x:Key="DeleteBrush" Color="#B4452F"/>
-    <SolidColorBrush x:Key="MoveBrush" Color="#5B4FB0"/>
-    <SolidColorBrush x:Key="CriticalBrush" Color="#A32626"/>
-    <SolidColorBrush x:Key="LowBrush" Color="#B35310"/>
-    <SolidColorBrush x:Key="WarningBrush" Color="#85680A"/>
-    <SolidColorBrush x:Key="HealthyBrush" Color="#2B6B49"/>
+    <SolidColorBrush x:Key="BgBrush" Color="@Bg@"/>
+    <SolidColorBrush x:Key="SurfaceBrush" Color="@Surface@"/>
+    <SolidColorBrush x:Key="SubtleBrush" Color="@Subtle@"/>
+    <SolidColorBrush x:Key="InkBrush" Color="@Ink@"/>
+    <SolidColorBrush x:Key="MutedBrush" Color="@Muted@"/>
+    <SolidColorBrush x:Key="LineBrush" Color="@Line@"/>
+    <SolidColorBrush x:Key="ControlBrush" Color="@Control@"/>
+    <SolidColorBrush x:Key="ControlLineBrush" Color="@ControlLine@"/>
+    <SolidColorBrush x:Key="HoverBrush" Color="@Hover@"/>
+    <SolidColorBrush x:Key="SelectedBrush" Color="@Selected@"/>
+    <SolidColorBrush x:Key="SelectedInkBrush" Color="@SelectedInk@"/>
+    <SolidColorBrush x:Key="TrackBrush" Color="@Track@"/>
+    <SolidColorBrush x:Key="AccentBrush" Color="@Accent@"/>
+    <SolidColorBrush x:Key="AccentHoverBrush" Color="@AccentHover@"/>
+    <SolidColorBrush x:Key="OnAccentBrush" Color="@OnAccent@"/>
+    <SolidColorBrush x:Key="DisabledBrush" Color="@Disabled@"/>
+    <SolidColorBrush x:Key="DisabledInkBrush" Color="@DisabledInk@"/>
+    <SolidColorBrush x:Key="NoticeBrush" Color="@Notice@"/>
+    <SolidColorBrush x:Key="NoticeLineBrush" Color="@NoticeLine@"/>
+    <SolidColorBrush x:Key="ScrollBrush" Color="@Scroll@"/>
+    <SolidColorBrush x:Key="CriticalBrush" Color="@Critical@"/>
+    <SolidColorBrush x:Key="LowBrush" Color="@Low@"/>
+    <SolidColorBrush x:Key="WarningBrush" Color="@Warning@"/>
+    <SolidColorBrush x:Key="HealthyBrush" Color="@Healthy@"/>
+
+    <Style x:Key="FocusRing">
+      <Setter Property="Control.Template">
+        <Setter.Value>
+          <ControlTemplate>
+            <Rectangle Margin="-3" RadiusX="6" RadiusY="6" StrokeThickness="2" Stroke="{StaticResource InkBrush}" SnapsToDevicePixels="True"/>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
 
     <Style x:Key="FieldLabel" TargetType="TextBlock">
       <Setter Property="FontSize" Value="12"/>
@@ -2285,25 +2734,44 @@ $script:TriageXaml = @'
 
     <Style x:Key="FieldBox" TargetType="TextBox">
       <Setter Property="Height" Value="32"/>
-      <Setter Property="Padding" Value="6,0,6,0"/>
+      <Setter Property="Padding" Value="8,0,8,0"/>
       <Setter Property="VerticalContentAlignment" Value="Center"/>
-      <Setter Property="Background" Value="#FFFFFF"/>
-      <Setter Property="BorderBrush" Value="#AEB9C1"/>
+      <Setter Property="Background" Value="{StaticResource ControlBrush}"/>
       <Setter Property="Foreground" Value="{StaticResource InkBrush}"/>
+      <Setter Property="CaretBrush" Value="{StaticResource InkBrush}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource ControlLineBrush}"/>
+      <Setter Property="FocusVisualStyle" Value="{StaticResource FocusRing}"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="TextBox">
+            <Border x:Name="Edge" Background="{TemplateBinding Background}" BorderBrush="{StaticResource LineBrush}" BorderThickness="1" CornerRadius="4">
+              <Border x:Name="Under" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="0,0,0,1" CornerRadius="4">
+                <ScrollViewer x:Name="PART_ContentHost" Margin="{TemplateBinding Padding}" VerticalAlignment="Center"/>
+              </Border>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsKeyboardFocused" Value="True">
+                <Setter TargetName="Under" Property="BorderBrush" Value="{StaticResource AccentBrush}"/>
+                <Setter TargetName="Under" Property="BorderThickness" Value="0,0,0,2"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
     </Style>
 
     <Style x:Key="ButtonBase" TargetType="Button">
       <Setter Property="Height" Value="32"/>
-      <Setter Property="MinWidth" Value="96"/>
-      <Setter Property="Padding" Value="16,0,16,0"/>
+      <Setter Property="MinWidth" Value="88"/>
+      <Setter Property="Padding" Value="12,0,12,0"/>
       <Setter Property="Margin" Value="0,0,8,0"/>
       <Setter Property="BorderThickness" Value="1"/>
-      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="FocusVisualStyle" Value="{StaticResource FocusRing}"/>
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="Button">
-            <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="6" Padding="{TemplateBinding Padding}">
-              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="4" Padding="{TemplateBinding Padding}">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" RecognizesAccessKey="True"/>
             </Border>
           </ControlTemplate>
         </Setter.Value>
@@ -2311,17 +2779,16 @@ $script:TriageXaml = @'
     </Style>
 
     <Style x:Key="PlainButton" TargetType="Button" BasedOn="{StaticResource ButtonBase}">
-      <Setter Property="Background" Value="#FFFFFF"/>
-      <Setter Property="BorderBrush" Value="#AEB9C1"/>
+      <Setter Property="Background" Value="{StaticResource ControlBrush}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource LineBrush}"/>
       <Setter Property="Foreground" Value="{StaticResource InkBrush}"/>
       <Style.Triggers>
         <Trigger Property="IsMouseOver" Value="True">
-          <Setter Property="Background" Value="#E6EEF1"/>
+          <Setter Property="Background" Value="{StaticResource HoverBrush}"/>
         </Trigger>
         <Trigger Property="IsEnabled" Value="False">
-          <Setter Property="Background" Value="#F1F4F6"/>
-          <Setter Property="BorderBrush" Value="#D3DBE0"/>
-          <Setter Property="Foreground" Value="#6B7782"/>
+          <Setter Property="Background" Value="{StaticResource DisabledBrush}"/>
+          <Setter Property="Foreground" Value="{StaticResource DisabledInkBrush}"/>
         </Trigger>
       </Style.Triggers>
     </Style>
@@ -2329,25 +2796,90 @@ $script:TriageXaml = @'
     <Style x:Key="PrimaryButton" TargetType="Button" BasedOn="{StaticResource ButtonBase}">
       <Setter Property="Background" Value="{StaticResource AccentBrush}"/>
       <Setter Property="BorderBrush" Value="{StaticResource AccentBrush}"/>
-      <Setter Property="Foreground" Value="#FFFFFF"/>
+      <Setter Property="Foreground" Value="{StaticResource OnAccentBrush}"/>
       <Setter Property="FontWeight" Value="SemiBold"/>
       <Style.Triggers>
         <Trigger Property="IsMouseOver" Value="True">
-          <Setter Property="Background" Value="#0A5563"/>
-          <Setter Property="BorderBrush" Value="#0A5563"/>
+          <Setter Property="Background" Value="{StaticResource AccentHoverBrush}"/>
+          <Setter Property="BorderBrush" Value="{StaticResource AccentHoverBrush}"/>
         </Trigger>
         <Trigger Property="IsEnabled" Value="False">
-          <Setter Property="Background" Value="#9DB9C0"/>
-          <Setter Property="BorderBrush" Value="#9DB9C0"/>
-          <Setter Property="Foreground" Value="#F4F8F9"/>
+          <Setter Property="Background" Value="{StaticResource DisabledBrush}"/>
+          <Setter Property="BorderBrush" Value="{StaticResource DisabledBrush}"/>
+          <Setter Property="Foreground" Value="{StaticResource DisabledInkBrush}"/>
         </Trigger>
       </Style.Triggers>
     </Style>
 
-    <Style x:Key="ScanButtonStyle" TargetType="Button" BasedOn="{StaticResource PrimaryButton}">
-      <Setter Property="Height" Value="36"/>
-      <Setter Property="MinWidth" Value="110"/>
-      <Setter Property="FontSize" Value="15"/>
+    <Style x:Key="Card" TargetType="Border">
+      <Setter Property="Background" Value="{StaticResource SurfaceBrush}"/>
+      <Setter Property="BorderBrush" Value="{StaticResource LineBrush}"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="CornerRadius" Value="8"/>
+    </Style>
+
+    <Style x:Key="TabIntro" TargetType="TextBlock">
+      <Setter Property="TextWrapping" Value="Wrap"/>
+      <Setter Property="Margin" Value="16,12,16,12"/>
+      <Setter Property="Foreground" Value="{StaticResource InkBrush}"/>
+    </Style>
+
+    <Style x:Key="ActionMessage" TargetType="TextBlock">
+      <Setter Property="TextWrapping" Value="Wrap"/>
+      <Setter Property="VerticalAlignment" Value="Center"/>
+      <Setter Property="Foreground" Value="{StaticResource InkBrush}"/>
+    </Style>
+
+    <Style TargetType="ScrollBar">
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Width" Value="12"/>
+      <Setter Property="MinWidth" Value="12"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ScrollBar">
+            <Grid Background="Transparent">
+              <Track x:Name="PART_Track" IsDirectionReversed="True">
+                <Track.Thumb>
+                  <Thumb>
+                    <Thumb.Template>
+                      <ControlTemplate TargetType="Thumb">
+                        <Border Margin="3,2,3,2" CornerRadius="3" Background="{StaticResource ScrollBrush}"/>
+                      </ControlTemplate>
+                    </Thumb.Template>
+                  </Thumb>
+                </Track.Thumb>
+              </Track>
+            </Grid>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+      <Style.Triggers>
+        <Trigger Property="Orientation" Value="Horizontal">
+          <Setter Property="Width" Value="Auto"/>
+          <Setter Property="MinWidth" Value="0"/>
+          <Setter Property="Height" Value="12"/>
+          <Setter Property="MinHeight" Value="12"/>
+          <Setter Property="Template">
+            <Setter.Value>
+              <ControlTemplate TargetType="ScrollBar">
+                <Grid Background="Transparent">
+                  <Track x:Name="PART_Track" IsDirectionReversed="False">
+                    <Track.Thumb>
+                      <Thumb>
+                        <Thumb.Template>
+                          <ControlTemplate TargetType="Thumb">
+                            <Border Margin="2,3,2,3" CornerRadius="3" Background="{StaticResource ScrollBrush}"/>
+                          </ControlTemplate>
+                        </Thumb.Template>
+                      </Thumb>
+                    </Track.Thumb>
+                  </Track>
+                </Grid>
+              </ControlTemplate>
+            </Setter.Value>
+          </Setter>
+        </Trigger>
+      </Style.Triggers>
     </Style>
 
     <Style x:Key="CleanTabs" TargetType="TabControl">
@@ -2358,38 +2890,44 @@ $script:TriageXaml = @'
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="TabControl">
-            <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="6">
-              <Grid KeyboardNavigation.TabNavigation="Local">
-                <Grid.RowDefinitions>
-                  <RowDefinition Height="Auto"/>
-                  <RowDefinition Height="*"/>
-                </Grid.RowDefinitions>
-                <Border Grid.Row="0" BorderBrush="{StaticResource LineBrush}" BorderThickness="0,0,0,1" Padding="8,0,8,0">
-                  <TabPanel IsItemsHost="True" Background="Transparent"/>
-                </Border>
-                <ContentPresenter Grid.Row="1" Content="{TemplateBinding SelectedContent}" ContentTemplate="{TemplateBinding SelectedContentTemplate}"/>
-              </Grid>
-            </Border>
+            <Grid KeyboardNavigation.TabNavigation="Local">
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+              </Grid.RowDefinitions>
+              <TabPanel Grid.Row="0" IsItemsHost="True" Background="Transparent" Margin="0,0,0,8"/>
+              <Border Grid.Row="1" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="8">
+                <ContentPresenter Content="{TemplateBinding SelectedContent}" ContentTemplate="{TemplateBinding SelectedContentTemplate}"/>
+              </Border>
+            </Grid>
           </ControlTemplate>
         </Setter.Value>
       </Setter>
     </Style>
 
     <Style x:Key="CleanTab" TargetType="TabItem">
-      <Setter Property="Background" Value="Transparent"/>
-      <Setter Property="BorderBrush" Value="Transparent"/>
-      <Setter Property="BorderThickness" Value="0,0,0,3"/>
       <Setter Property="Foreground" Value="{StaticResource MutedBrush}"/>
-      <Setter Property="FontWeight" Value="SemiBold"/>
-      <Setter Property="Padding" Value="14,8,14,7"/>
-      <Setter Property="Margin" Value="0,0,4,0"/>
-      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="FontSize" Value="13.5"/>
+      <Setter Property="Padding" Value="12,6,12,4"/>
+      <Setter Property="Margin" Value="0,0,2,0"/>
+      <Setter Property="FocusVisualStyle" Value="{StaticResource FocusRing}"/>
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="TabItem">
-            <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}" Padding="{TemplateBinding Padding}">
-              <ContentPresenter Content="{TemplateBinding Header}" ContentTemplate="{TemplateBinding HeaderTemplate}" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            <Border x:Name="Back" Background="Transparent" CornerRadius="4" Padding="{TemplateBinding Padding}">
+              <StackPanel>
+                <ContentPresenter Content="{TemplateBinding Header}" ContentTemplate="{TemplateBinding HeaderTemplate}" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                <Border x:Name="Pill" Height="3" Width="20" Margin="0,4,0,0" CornerRadius="1.5" Background="Transparent" HorizontalAlignment="Center"/>
+              </StackPanel>
             </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Back" Property="Background" Value="{StaticResource HoverBrush}"/>
+              </Trigger>
+              <Trigger Property="IsSelected" Value="True">
+                <Setter TargetName="Pill" Property="Background" Value="{StaticResource AccentBrush}"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
           </ControlTemplate>
         </Setter.Value>
       </Setter>
@@ -2399,27 +2937,58 @@ $script:TriageXaml = @'
         </Trigger>
         <Trigger Property="IsSelected" Value="True">
           <Setter Property="Foreground" Value="{StaticResource InkBrush}"/>
-          <Setter Property="BorderBrush" Value="{StaticResource AccentBrush}"/>
+          <Setter Property="FontWeight" Value="SemiBold"/>
         </Trigger>
       </Style.Triggers>
     </Style>
 
-    <Style x:Key="HeaderBase" TargetType="DataGridColumnHeader">
-      <Setter Property="Background" Value="{StaticResource HeaderBrush}"/>
+    <Style x:Key="FilterItem" TargetType="ListBoxItem">
       <Setter Property="Foreground" Value="{StaticResource InkBrush}"/>
+      <Setter Property="Margin" Value="0,0,4,0"/>
+      <Setter Property="FocusVisualStyle" Value="{StaticResource FocusRing}"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ListBoxItem">
+            <Border x:Name="Back" Background="{StaticResource ControlBrush}" BorderBrush="{StaticResource LineBrush}" BorderThickness="1" CornerRadius="14" Padding="12,4,12,5">
+              <ContentPresenter/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Back" Property="Background" Value="{StaticResource HoverBrush}"/>
+              </Trigger>
+              <Trigger Property="IsSelected" Value="True">
+                <Setter TargetName="Back" Property="Background" Value="{StaticResource AccentBrush}"/>
+                <Setter TargetName="Back" Property="BorderBrush" Value="{StaticResource AccentBrush}"/>
+                <Setter Property="Foreground" Value="{StaticResource OnAccentBrush}"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style x:Key="HeaderBase" TargetType="DataGridColumnHeader">
+      <Setter Property="Foreground" Value="{StaticResource MutedBrush}"/>
+      <Setter Property="FontSize" Value="12"/>
       <Setter Property="FontWeight" Value="SemiBold"/>
-      <Setter Property="Padding" Value="10,6,10,6"/>
-      <Setter Property="BorderBrush" Value="{StaticResource LineBrush}"/>
-      <Setter Property="BorderThickness" Value="0,0,0,1"/>
+      <Setter Property="HorizontalContentAlignment" Value="Left"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="DataGridColumnHeader">
+            <Border Background="{StaticResource SubtleBrush}" BorderBrush="{StaticResource LineBrush}" BorderThickness="0,0,0,1" Padding="12,0,12,0">
+              <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" VerticalAlignment="Center"/>
+            </Border>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
     </Style>
     <Style x:Key="HeaderRight" TargetType="DataGridColumnHeader" BasedOn="{StaticResource HeaderBase}">
       <Setter Property="HorizontalContentAlignment" Value="Right"/>
     </Style>
 
     <Style x:Key="CellText" TargetType="TextBlock">
-      <Setter Property="Margin" Value="10,0,10,0"/>
+      <Setter Property="Margin" Value="12,0,12,0"/>
       <Setter Property="VerticalAlignment" Value="Center"/>
-      <Setter Property="Foreground" Value="{StaticResource InkBrush}"/>
     </Style>
     <Style x:Key="CellBold" TargetType="TextBlock" BasedOn="{StaticResource CellText}">
       <Setter Property="FontWeight" Value="SemiBold"/>
@@ -2429,19 +2998,22 @@ $script:TriageXaml = @'
     </Style>
     <Style x:Key="CellWrap" TargetType="TextBlock" BasedOn="{StaticResource CellText}">
       <Setter Property="TextWrapping" Value="Wrap"/>
-      <Setter Property="Margin" Value="10,5,10,5"/>
+      <Setter Property="Margin" Value="12,6,12,6"/>
     </Style>
     <Style x:Key="CellTrim" TargetType="TextBlock" BasedOn="{StaticResource CellText}">
       <Setter Property="TextTrimming" Value="CharacterEllipsis"/>
     </Style>
 
     <Style x:Key="GridRow" TargetType="DataGridRow">
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Foreground" Value="{StaticResource InkBrush}"/>
       <Style.Triggers>
         <Trigger Property="IsMouseOver" Value="True">
-          <Setter Property="Background" Value="#F0F5F7"/>
+          <Setter Property="Background" Value="{StaticResource HoverBrush}"/>
         </Trigger>
         <Trigger Property="IsSelected" Value="True">
-          <Setter Property="Background" Value="#D6EBEF"/>
+          <Setter Property="Background" Value="{StaticResource SelectedBrush}"/>
+          <Setter Property="Foreground" Value="{StaticResource SelectedInkBrush}"/>
         </Trigger>
       </Style.Triggers>
     </Style>
@@ -2449,26 +3021,40 @@ $script:TriageXaml = @'
     <Style x:Key="GridCell" TargetType="DataGridCell">
       <Setter Property="Background" Value="Transparent"/>
       <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
       <Setter Property="Foreground" Value="{StaticResource InkBrush}"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="DataGridCell">
+            <Border Background="Transparent">
+              <ContentPresenter VerticalAlignment="Center"/>
+            </Border>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
       <Style.Triggers>
         <Trigger Property="IsSelected" Value="True">
-          <Setter Property="Background" Value="Transparent"/>
-          <Setter Property="BorderBrush" Value="Transparent"/>
-          <Setter Property="Foreground" Value="{StaticResource InkBrush}"/>
+          <Setter Property="Foreground" Value="{StaticResource SelectedInkBrush}"/>
         </Trigger>
       </Style.Triggers>
     </Style>
 
     <Style x:Key="GridStyle" TargetType="DataGrid">
-      <Setter Property="Background" Value="{StaticResource SurfaceBrush}"/>
-      <Setter Property="RowBackground" Value="{StaticResource SurfaceBrush}"/>
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="RowBackground" Value="Transparent"/>
+      <Setter Property="Foreground" Value="{StaticResource InkBrush}"/>
       <Setter Property="BorderThickness" Value="0"/>
-      <Setter Property="HorizontalGridLinesBrush" Value="#E3E8EC"/>
+      <Setter Property="HorizontalGridLinesBrush" Value="{StaticResource LineBrush}"/>
       <Setter Property="SelectionMode" Value="Single"/>
       <Setter Property="SelectionUnit" Value="FullRow"/>
       <Setter Property="MinRowHeight" Value="36"/>
-      <Setter Property="ColumnHeaderHeight" Value="36"/>
+      <Setter Property="ColumnHeaderHeight" Value="32"/>
       <Setter Property="CanUserResizeRows" Value="False"/>
+      <Setter Property="AutoGenerateColumns" Value="False"/>
+      <Setter Property="IsReadOnly" Value="True"/>
+      <Setter Property="CanUserAddRows" Value="False"/>
+      <Setter Property="HeadersVisibility" Value="Column"/>
+      <Setter Property="GridLinesVisibility" Value="Horizontal"/>
       <Setter Property="ColumnHeaderStyle" Value="{StaticResource HeaderBase}"/>
       <Setter Property="RowStyle" Value="{StaticResource GridRow}"/>
       <Setter Property="CellStyle" Value="{StaticResource GridCell}"/>
@@ -2480,260 +3066,208 @@ $script:TriageXaml = @'
       <RowDefinition Height="Auto"/>
       <RowDefinition Height="Auto"/>
       <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
       <RowDefinition Height="*"/>
       <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
 
-    <!-- Row 0: header band with the promise and the two drive gauges -->
-    <Border Grid.Row="0" Background="{StaticResource BandBrush}" Padding="24,12,24,12">
+    <!-- Row 0: title and the two drive gauges -->
+    <Grid Grid.Row="0" Margin="24,16,24,0">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="*"/>
+        <ColumnDefinition Width="Auto"/>
+      </Grid.ColumnDefinitions>
+      <StackPanel Grid.Column="0" VerticalAlignment="Center" Margin="0,0,16,0">
+        <TextBlock Text="Disk Space Triage" FontFamily="Segoe UI Variable Display, Segoe UI" FontSize="24" FontWeight="SemiBold" Foreground="{StaticResource InkBrush}"/>
+        <TextBlock Text="Scan, then move or remove what fills the drive. Scanning only reads sizes; every change asks first." Margin="0,2,0,0" TextWrapping="Wrap" Foreground="{StaticResource MutedBrush}"/>
+      </StackPanel>
+      <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+        <Border Width="268" Margin="0,0,8,0" Padding="12,8,12,10" Style="{StaticResource Card}">
+          <StackPanel>
+            <Grid>
+              <TextBlock Text="Drive to free up" FontSize="12" Foreground="{StaticResource MutedBrush}"/>
+              <TextBlock x:Name="SourceDriveStatus" Text="-" FontSize="12" HorizontalAlignment="Right" FontWeight="SemiBold" Foreground="{StaticResource MutedBrush}"/>
+            </Grid>
+            <TextBlock x:Name="SourceDriveLabel" Text="-" Margin="0,4,0,0" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" Foreground="{StaticResource InkBrush}"/>
+            <ProgressBar x:Name="SourceDriveBar" Minimum="0" Maximum="100" Value="0" Height="4" Margin="0,8,0,0" BorderThickness="0" Background="{StaticResource TrackBrush}" Foreground="{StaticResource AccentBrush}" AutomationProperties.Name="Used space on the drive to free up"/>
+          </StackPanel>
+        </Border>
+        <Border Width="268" Padding="12,8,12,10" Style="{StaticResource Card}">
+          <StackPanel>
+            <Grid>
+              <TextBlock Text="Drive to move things to" FontSize="12" Foreground="{StaticResource MutedBrush}"/>
+              <TextBlock x:Name="DestDriveStatus" Text="-" FontSize="12" HorizontalAlignment="Right" FontWeight="SemiBold" Foreground="{StaticResource MutedBrush}"/>
+            </Grid>
+            <TextBlock x:Name="DestDriveLabel" Text="-" Margin="0,4,0,0" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" Foreground="{StaticResource InkBrush}"/>
+            <ProgressBar x:Name="DestDriveBar" Minimum="0" Maximum="100" Value="0" Height="4" Margin="0,8,0,0" BorderThickness="0" Background="{StaticResource TrackBrush}" Foreground="{StaticResource AccentBrush}" AutomationProperties.Name="Used space on the drive to move things to"/>
+          </StackPanel>
+        </Border>
+      </StackPanel>
+    </Grid>
+
+    <!-- Row 1: scan controls -->
+    <Grid Grid.Row="1" Margin="24,12,24,0">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="Auto"/>
+        <ColumnDefinition Width="*"/>
+        <ColumnDefinition Width="Auto"/>
+      </Grid.ColumnDefinitions>
+      <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Bottom">
+        <StackPanel Margin="0,0,8,0">
+          <TextBlock Text="Free up" Style="{StaticResource FieldLabel}"/>
+          <TextBox x:Name="SourceBox" Text="C" MaxLength="1" CharacterCasing="Upper" Width="56" TextAlignment="Center" Style="{StaticResource FieldBox}" AutomationProperties.Name="Letter of the drive to free up"/>
+        </StackPanel>
+        <StackPanel Margin="0,0,8,0">
+          <TextBlock Text="Move to" Style="{StaticResource FieldLabel}"/>
+          <TextBox x:Name="DestBox" Text="D" MaxLength="1" CharacterCasing="Upper" Width="56" TextAlignment="Center" Style="{StaticResource FieldBox}" AutomationProperties.Name="Letter of the drive to move things to"/>
+        </StackPanel>
+        <StackPanel Margin="0,0,8,0">
+          <TextBlock Text="List files over (MB)" Style="{StaticResource FieldLabel}"/>
+          <TextBox x:Name="MinSizeBox" Text="100" Width="104" TextAlignment="Right" Style="{StaticResource FieldBox}" AutomationProperties.Name="Smallest file size to list, in megabytes"/>
+        </StackPanel>
+      </StackPanel>
+      <StackPanel Grid.Column="1" VerticalAlignment="Bottom" Margin="0,0,16,0">
+        <TextBlock Text="Extra folders to scan (optional; full paths separated by ;)" Style="{StaticResource FieldLabel}" TextTrimming="CharacterEllipsis"/>
+        <TextBox x:Name="ExtraRootsBox" Style="{StaticResource FieldBox}" AutomationProperties.Name="Extra folders to scan"/>
+      </StackPanel>
+      <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Bottom">
+        <Button x:Name="ScanButton" Content="_Scan" MinWidth="104" Style="{StaticResource PrimaryButton}"/>
+        <Button x:Name="CancelButton" Content="Cancel" IsEnabled="False" Style="{StaticResource PlainButton}"/>
+        <Button x:Name="ExportButton" Content="Save _report" Style="{StaticResource PlainButton}" Margin="0"/>
+      </StackPanel>
+    </Grid>
+
+    <!-- Row 2: what is happening now -->
+    <StackPanel Grid.Row="2" Margin="24,12,24,0">
+      <TextBlock x:Name="ProgressText" Text="Choose Scan to see what is filling the drive. Scanning changes nothing." FontWeight="SemiBold" TextTrimming="CharacterEllipsis" Foreground="{StaticResource InkBrush}"/>
+      <ProgressBar x:Name="BusyBar" Minimum="0" Maximum="100" Value="0" Height="4" Margin="0,6,0,0" BorderThickness="0" Visibility="Hidden" Background="{StaticResource TrackBrush}" Foreground="{StaticResource AccentBrush}" AutomationProperties.Name="Progress of the current task"/>
+    </StackPanel>
+
+    <!-- Row 3: free space and the Recycle Bin -->
+    <Border Grid.Row="3" Margin="24,8,24,0" Padding="16,8,8,8" Background="{StaticResource NoticeBrush}" BorderBrush="{StaticResource NoticeLineBrush}" BorderThickness="1" CornerRadius="8">
       <Grid>
         <Grid.ColumnDefinitions>
           <ColumnDefinition Width="*"/>
           <ColumnDefinition Width="Auto"/>
         </Grid.ColumnDefinitions>
         <StackPanel Grid.Column="0" VerticalAlignment="Center" Margin="0,0,16,0">
-          <TextBlock Text="Disk Space Triage" FontSize="24" FontWeight="SemiBold" Foreground="#FFFFFF"/>
-          <TextBlock Text="Find. Understand. Fix." FontSize="14" Margin="0,1,0,0" Foreground="#A9DCE6"/>
-          <TextBlock Text="Scanning only reads folder sizes. Nothing changes unless you allow it on one of the action tabs." FontSize="11.5" Margin="0,3,0,0" TextWrapping="Wrap" Foreground="#C9D9DF"/>
+          <TextBlock x:Name="RecycleText" Text="Recycle Bin: not checked yet." FontWeight="SemiBold" TextWrapping="Wrap" Foreground="{StaticResource InkBrush}"/>
+          <TextBlock x:Name="SessionText" Text="Space freed in this session: none yet." Margin="0,2,0,0" TextWrapping="Wrap" Foreground="{StaticResource InkBrush}"/>
         </StackPanel>
         <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-          <Border Width="290" Margin="0,0,12,0" Padding="12,8,12,9" Background="{StaticResource SurfaceBrush}" CornerRadius="6">
-            <StackPanel>
-              <Grid>
-                <TextBlock Text="Source drive" FontSize="12" Margin="0" Foreground="{StaticResource MutedBrush}"/>
-                <TextBlock x:Name="SourceDriveStatus" Text="-" FontSize="12" HorizontalAlignment="Right" FontWeight="SemiBold" Foreground="{StaticResource MutedBrush}"/>
-              </Grid>
-              <TextBlock x:Name="SourceDriveLabel" Text="-" Margin="0,3,0,0" FontSize="12.5" Foreground="{StaticResource InkBrush}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
-              <ProgressBar x:Name="SourceDriveBar" Minimum="0" Maximum="100" Value="0" Height="8" Margin="0,6,0,0" BorderThickness="0" Background="{StaticResource TrackBrush}" Foreground="{StaticResource AccentBrush}"/>
-            </StackPanel>
-          </Border>
-          <Border Width="290" Padding="12,8,12,9" Background="{StaticResource SurfaceBrush}" CornerRadius="6">
-            <StackPanel>
-              <Grid>
-                <TextBlock Text="Destination drive" FontSize="12" Margin="0" Foreground="{StaticResource MutedBrush}"/>
-                <TextBlock x:Name="DestDriveStatus" Text="-" FontSize="12" HorizontalAlignment="Right" FontWeight="SemiBold" Foreground="{StaticResource MutedBrush}"/>
-              </Grid>
-              <TextBlock x:Name="DestDriveLabel" Text="-" Margin="0,3,0,0" FontSize="12.5" Foreground="{StaticResource InkBrush}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
-              <ProgressBar x:Name="DestDriveBar" Minimum="0" Maximum="100" Value="0" Height="8" Margin="0,6,0,0" BorderThickness="0" Background="{StaticResource TrackBrush}" Foreground="{StaticResource AccentBrush}"/>
-            </StackPanel>
-          </Border>
+          <Button x:Name="EmptyBinButton" Content="_Empty Recycle Bin..." Style="{StaticResource PrimaryButton}"/>
+          <Button x:Name="SummaryButton" Content="Copy summary" ToolTip="Copies what was done and the free space before and after. Contains no file or folder names." Style="{StaticResource PlainButton}"/>
         </StackPanel>
       </Grid>
     </Border>
 
-    <!-- Row 1: controls -->
-    <Grid Grid.Row="1" Margin="24,14,24,0">
-      <Grid.ColumnDefinitions>
-        <ColumnDefinition Width="Auto"/>
-        <ColumnDefinition Width="*"/>
-        <ColumnDefinition Width="Auto"/>
-      </Grid.ColumnDefinitions>
-      <Grid.RowDefinitions>
-        <RowDefinition Height="Auto"/>
-        <RowDefinition Height="Auto"/>
-      </Grid.RowDefinitions>
-      <StackPanel Grid.Row="0" Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Bottom">
-        <StackPanel Margin="0,0,12,0">
-          <TextBlock Text="Source drive" Style="{StaticResource FieldLabel}"/>
-          <TextBox x:Name="SourceBox" Text="C" MaxLength="1" CharacterCasing="Upper" Width="56" TextAlignment="Center" Style="{StaticResource FieldBox}"/>
-        </StackPanel>
-        <StackPanel Margin="0,0,12,0">
-          <TextBlock Text="Destination drive" Style="{StaticResource FieldLabel}"/>
-          <TextBox x:Name="DestBox" Text="D" MaxLength="1" CharacterCasing="Upper" Width="56" TextAlignment="Center" Style="{StaticResource FieldBox}"/>
-        </StackPanel>
-        <StackPanel Margin="0,0,12,0">
-          <TextBlock Text="Min file size (MB)" Style="{StaticResource FieldLabel}"/>
-          <TextBox x:Name="MinSizeBox" Text="100" Width="84" TextAlignment="Right" Style="{StaticResource FieldBox}"/>
-        </StackPanel>
-      </StackPanel>
-      <StackPanel Grid.Row="0" Grid.Column="1" VerticalAlignment="Bottom" Margin="0,0,16,0">
-        <TextBlock Text="Extra folders to scan (optional, full paths, separated by ;)" Style="{StaticResource FieldLabel}" TextTrimming="CharacterEllipsis"/>
-        <TextBox x:Name="ExtraRootsBox" Style="{StaticResource FieldBox}"/>
-      </StackPanel>
-      <StackPanel Grid.Row="0" Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Bottom">
-        <Button x:Name="ScanButton" Content="Scan" Style="{StaticResource ScanButtonStyle}"/>
-        <Button x:Name="CancelButton" Content="Cancel" IsEnabled="False" Style="{StaticResource PlainButton}" Height="36" MinWidth="84"/>
-        <Button x:Name="ExportButton" Content="Export report" IsEnabled="False" Style="{StaticResource PlainButton}" Height="36" Margin="0"/>
-      </StackPanel>
-      <TextBlock x:Name="ProgressText" Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="3" Text="Pick your drives, then select Scan. Scanning only reads folder sizes." Margin="0,8,0,0" FontSize="13" FontWeight="SemiBold" Foreground="{StaticResource InkBrush}" TextTrimming="CharacterEllipsis"/>
-    </Grid>
-
-    <!-- Row 2: summary cards -->
-    <Grid Grid.Row="2" Margin="24,14,24,0">
-      <Grid.ColumnDefinitions>
-        <ColumnDefinition Width="*"/>
-        <ColumnDefinition Width="*"/>
-        <ColumnDefinition Width="*"/>
-      </Grid.ColumnDefinitions>
-      <Border Grid.Column="0" Margin="0,0,8,0" Background="{StaticResource SurfaceBrush}" BorderBrush="{StaticResource LineBrush}" BorderThickness="1" CornerRadius="6">
-        <Grid>
-          <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-          </Grid.RowDefinitions>
-          <Border Grid.Row="0" Height="4" Background="{StaticResource RedirectBrush}" CornerRadius="5,5,0,0"/>
-          <StackPanel Grid.Row="1" Margin="16,8,16,10">
-            <TextBlock Text="Redirect" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource RedirectBrush}"/>
-            <StackPanel Orientation="Horizontal">
-              <TextBlock x:Name="RedirectSize" Text="-" FontSize="24" FontWeight="SemiBold" Foreground="{StaticResource InkBrush}"/>
-              <TextBlock x:Name="RedirectFiles" Text="0 files" VerticalAlignment="Bottom" Margin="10,0,0,4" Foreground="{StaticResource MutedBrush}"/>
-            </StackPanel>
-            <TextBlock Text="One setting stops it growing again." Margin="0,2,0,0" FontSize="12.5" TextTrimming="CharacterEllipsis" Foreground="{StaticResource InkBrush}"/>
-          </StackPanel>
-        </Grid>
-      </Border>
-      <Border Grid.Column="1" Margin="4,0,4,0" Background="{StaticResource SurfaceBrush}" BorderBrush="{StaticResource LineBrush}" BorderThickness="1" CornerRadius="6">
-        <Grid>
-          <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-          </Grid.RowDefinitions>
-          <Border Grid.Row="0" Height="4" Background="{StaticResource DeleteBrush}" CornerRadius="5,5,0,0"/>
-          <StackPanel Grid.Row="1" Margin="16,8,16,10">
-            <TextBlock Text="Delete" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource DeleteBrush}"/>
-            <StackPanel Orientation="Horizontal">
-              <TextBlock x:Name="DeleteSize" Text="-" FontSize="24" FontWeight="SemiBold" Foreground="{StaticResource InkBrush}"/>
-              <TextBlock x:Name="DeleteFiles" Text="0 files" VerticalAlignment="Bottom" Margin="10,0,0,4" Foreground="{StaticResource MutedBrush}"/>
-            </StackPanel>
-            <TextBlock Text="Rebuilds itself. Delete it, never copy it." Margin="0,2,0,0" FontSize="12.5" TextTrimming="CharacterEllipsis" Foreground="{StaticResource InkBrush}"/>
-          </StackPanel>
-        </Grid>
-      </Border>
-      <Border Grid.Column="2" Margin="8,0,0,0" Background="{StaticResource SurfaceBrush}" BorderBrush="{StaticResource LineBrush}" BorderThickness="1" CornerRadius="6">
-        <Grid>
-          <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-          </Grid.RowDefinitions>
-          <Border Grid.Row="0" Height="4" Background="{StaticResource MoveBrush}" CornerRadius="5,5,0,0"/>
-          <StackPanel Grid.Row="1" Margin="16,8,16,10">
-            <TextBlock Text="Move" FontWeight="SemiBold" FontSize="14" Foreground="{StaticResource MoveBrush}"/>
-            <StackPanel Orientation="Horizontal">
-              <TextBlock x:Name="MoveSize" Text="-" FontSize="24" FontWeight="SemiBold" Foreground="{StaticResource InkBrush}"/>
-              <TextBlock x:Name="MoveFiles" Text="0 files" VerticalAlignment="Bottom" Margin="10,0,0,4" Foreground="{StaticResource MutedBrush}"/>
-            </StackPanel>
-            <TextBlock Text="Copy, check, then delete the original." Margin="0,2,0,0" FontSize="12.5" TextTrimming="CharacterEllipsis" Foreground="{StaticResource InkBrush}"/>
-          </StackPanel>
-        </Grid>
-      </Border>
-    </Grid>
-
-    <!-- Row 3: tabs -->
-    <TabControl x:Name="MainTabs" Grid.Row="3" Margin="24,14,24,0" Style="{StaticResource CleanTabs}" ItemContainerStyle="{StaticResource CleanTab}">
-      <TabItem Header="Do these first">
-        <DataGrid x:Name="MechanismsGrid" Style="{StaticResource GridStyle}" AutoGenerateColumns="False" IsReadOnly="True" CanUserAddRows="False" HeadersVisibility="Column" GridLinesVisibility="Horizontal">
+    <!-- Row 4: tabs -->
+    <TabControl x:Name="MainTabs" Grid.Row="4" Margin="24,12,24,0" Style="{StaticResource CleanTabs}" ItemContainerStyle="{StaticResource CleanTab}">
+      <TabItem Header="Overview">
+        <DataGrid x:Name="MechanismsGrid" Style="{StaticResource GridStyle}" AutomationProperties.Name="What uses the space, largest first">
           <DataGrid.Columns>
-            <DataGridTextColumn Header="Size" Binding="{Binding SizeText, Mode=OneWay}" SortMemberPath="TotalBytes" Width="110" ElementStyle="{StaticResource CellRight}" HeaderStyle="{StaticResource HeaderRight}"/>
-            <DataGridTextColumn Header="Type" Binding="{Binding Bucket, Mode=OneWay}" Width="90" ElementStyle="{StaticResource CellBold}"/>
+            <DataGridTextColumn Header="Size" Binding="{Binding SizeText, Mode=OneWay}" SortMemberPath="TotalBytes" Width="104" ElementStyle="{StaticResource CellRight}" HeaderStyle="{StaticResource HeaderRight}"/>
+            <DataGridTextColumn Header="Kind" Binding="{Binding Bucket, Mode=OneWay}" Width="88" ElementStyle="{StaticResource CellBold}"/>
             <DataGridTextColumn Header="What to do" Binding="{Binding Mechanism, Mode=OneWay}" Width="2*" MinWidth="240" ElementStyle="{StaticResource CellWrap}"/>
             <DataGridTextColumn Header="What it is" Binding="{Binding Note, Mode=OneWay}" Width="2*" MinWidth="240" ElementStyle="{StaticResource CellWrap}"/>
-            <DataGridTextColumn Header="Files" Binding="{Binding FilesText, Mode=OneWay}" SortMemberPath="Files" Width="90" ElementStyle="{StaticResource CellRight}" HeaderStyle="{StaticResource HeaderRight}"/>
+            <DataGridTextColumn Header="Files" Binding="{Binding FilesText, Mode=OneWay}" SortMemberPath="Files" Width="88" ElementStyle="{StaticResource CellRight}" HeaderStyle="{StaticResource HeaderRight}"/>
           </DataGrid.Columns>
         </DataGrid>
       </TabItem>
 
-      <TabItem Header="Fix with one setting">
+      <TabItem x:Name="RedirectTab" Header="Move caches">
         <Grid>
           <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
           </Grid.RowDefinitions>
-          <Border Grid.Row="0" Margin="12,12,12,10" Padding="14,8,14,8" Background="#FFF3D1" BorderBrush="#C8962B" BorderThickness="4,1,1,1" CornerRadius="6">
-            <StackPanel>
-              <TextBlock TextWrapping="Wrap" FontSize="12.5" Foreground="{StaticResource InkBrush}" Text="The tool can set a user environment variable so a cache is stored on the other drive from now on. It creates an empty folder there and sets the variable. It does not move or delete anything: the old folder stays where it is, and the tool tells you what to do with it. Each change asks for confirmation and can be undone until you close this window."/>
-              <CheckBox x:Name="EnableActionsBox" Content="Allow this tool to make these changes" IsChecked="False" Margin="0,8,0,0" FontWeight="SemiBold" Foreground="{StaticResource InkBrush}"/>
-            </StackPanel>
+          <TextBlock Grid.Row="0" Style="{StaticResource TabIntro}" Text="Download caches and model stores of Python, Hugging Face, Ollama, npm and similar tools. Moving one copies every file to the other drive, checks each copy, tells the tool to use the new folder from now on, and then removes the old folder. Close the tool that owns the store first."/>
+          <Border Grid.Row="1" BorderBrush="{StaticResource LineBrush}" BorderThickness="0,1,0,1">
+            <DataGrid x:Name="RedirectGrid" Style="{StaticResource GridStyle}" AutomationProperties.Name="Caches and model stores that can move">
+              <DataGrid.Columns>
+                <DataGridTextColumn Header="Size now" Binding="{Binding SizeText, Mode=OneWay}" SortMemberPath="SizeBytes" Width="96" ElementStyle="{StaticResource CellRight}" HeaderStyle="{StaticResource HeaderRight}"/>
+                <DataGridTextColumn Header="Store (setting)" Binding="{Binding Variable, Mode=OneWay}" Width="152" ElementStyle="{StaticResource CellBold}"/>
+                <DataGridTextColumn Header="Status" Binding="{Binding StatusText, Mode=OneWay}" Width="232" ElementStyle="{StaticResource CellWrap}"/>
+                <DataGridTextColumn Header="New folder" Binding="{Binding ProposedValue, Mode=OneWay}" Width="2*" MinWidth="240" ElementStyle="{StaticResource CellWrap}"/>
+                <DataGridTextColumn Header="Good to know" Binding="{Binding Effect, Mode=OneWay}" Width="2*" MinWidth="240" ElementStyle="{StaticResource CellWrap}"/>
+              </DataGrid.Columns>
+            </DataGrid>
           </Border>
-          <DataGrid x:Name="RedirectGrid" Grid.Row="1" Style="{StaticResource GridStyle}" AutoGenerateColumns="False" IsReadOnly="True" CanUserAddRows="False" HeadersVisibility="Column" GridLinesVisibility="Horizontal" SelectionMode="Single">
-            <DataGrid.Columns>
-              <DataGridTextColumn Header="Size now" Binding="{Binding SizeText, Mode=OneWay}" SortMemberPath="SizeBytes" Width="100" ElementStyle="{StaticResource CellRight}" HeaderStyle="{StaticResource HeaderRight}"/>
-              <DataGridTextColumn Header="Variable" Binding="{Binding Variable, Mode=OneWay}" Width="150" ElementStyle="{StaticResource CellBold}"/>
-              <DataGridTextColumn Header="New folder" Binding="{Binding ProposedValue, Mode=OneWay}" Width="2*" MinWidth="260" ElementStyle="{StaticResource CellWrap}"/>
-              <DataGridTextColumn Header="Status" Binding="{Binding StatusText, Mode=OneWay}" Width="230" ElementStyle="{StaticResource CellWrap}"/>
-              <DataGridTextColumn Header="What happens" Binding="{Binding Effect, Mode=OneWay}" Width="2*" MinWidth="260" ElementStyle="{StaticResource CellWrap}"/>
-            </DataGrid.Columns>
-          </DataGrid>
-          <Grid Grid.Row="2" Margin="12,10,12,10">
-            <Grid.ColumnDefinitions>
-              <ColumnDefinition Width="Auto"/>
-              <ColumnDefinition Width="*" MinWidth="300"/>
-            </Grid.ColumnDefinitions>
-            <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Top">
-              <Button x:Name="ApplyRedirectButton" Content="Apply selected..." IsEnabled="False" Style="{StaticResource PrimaryButton}"/>
-              <Button x:Name="UndoRedirectButton" Content="Undo last change" IsEnabled="False" Style="{StaticResource PlainButton}" Margin="0,0,16,0"/>
+          <Grid Grid.Row="2" Margin="16,12,16,12">
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <StackPanel Grid.Row="0" Orientation="Horizontal">
+              <Button x:Name="MoveStoreButton" Content="_Move to the other drive..." Style="{StaticResource PrimaryButton}"/>
+              <Button x:Name="ApplyRedirectButton" Content="Only change the setting..." ToolTip="New downloads go to the other drive. The files that are on this drive now stay, so no space is freed." Style="{StaticResource PlainButton}"/>
+              <Button x:Name="UndoRedirectButton" Content="Undo last setting change" Style="{StaticResource PlainButton}"/>
             </StackPanel>
-            <TextBlock x:Name="RedirectMessage" Grid.Column="1" TextWrapping="Wrap" VerticalAlignment="Center" FontSize="12.5" Foreground="{StaticResource InkBrush}"/>
+            <TextBlock x:Name="RedirectMessage" Grid.Row="1" Margin="0,8,0,0" Style="{StaticResource ActionMessage}"/>
           </Grid>
         </Grid>
       </TabItem>
 
-      <TabItem Header="Delete rebuildable folders">
+      <TabItem x:Name="DeleteTab" Header="Delete">
         <Grid>
           <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
           </Grid.RowDefinitions>
-          <Border Grid.Row="0" Margin="12,12,12,10" Padding="14,8,14,8" Background="#FFF3D1" BorderBrush="#C8962B" BorderThickness="4,1,1,1" CornerRadius="6">
-            <StackPanel>
-              <TextBlock TextWrapping="Wrap" FontSize="12.5" Foreground="{StaticResource InkBrush}" Text="These folders can be rebuilt or refill by themselves: package folders with a lockfile, shader and browser caches, crash dumps. The tool asks Windows to put the whole folder in the Recycle Bin, so you can restore it. Folders too large for the Recycle Bin are not offered. Space is freed when you empty the Recycle Bin. Close the application that owns a cache first."/>
-              <CheckBox x:Name="EnableDeleteBox" Content="Allow this tool to send folders to the Recycle Bin" IsChecked="False" Margin="0,8,0,0" FontWeight="SemiBold" Foreground="{StaticResource InkBrush}"/>
-            </StackPanel>
+          <TextBlock Grid.Row="0" Style="{StaticResource TabIntro}" Text="Folders that rebuild or refill by themselves: package folders with a lockfile, shader and browser caches, crash dumps. Deleting sends the whole folder to the Recycle Bin, so you can still restore it. The space is free only after you empty the Recycle Bin (button above). Close the application that owns a cache first."/>
+          <Border Grid.Row="1" BorderBrush="{StaticResource LineBrush}" BorderThickness="0,1,0,1">
+            <DataGrid x:Name="DeleteGrid" Style="{StaticResource GridStyle}" AutomationProperties.Name="Folders that can be deleted">
+              <DataGrid.Columns>
+                <DataGridTextColumn Header="Size" Binding="{Binding SizeText, Mode=OneWay}" SortMemberPath="SizeBytes" Width="96" ElementStyle="{StaticResource CellRight}" HeaderStyle="{StaticResource HeaderRight}"/>
+                <DataGridTextColumn Header="What it is" Binding="{Binding Note, Mode=OneWay}" Width="216" ElementStyle="{StaticResource CellWrap}"/>
+                <DataGridTextColumn Header="Status" Binding="{Binding StatusText, Mode=OneWay}" Width="232" ElementStyle="{StaticResource CellWrap}"/>
+                <DataGridTextColumn Header="Folder" Binding="{Binding Path, Mode=OneWay}" Width="*" MinWidth="280" ElementStyle="{StaticResource CellWrap}"/>
+              </DataGrid.Columns>
+            </DataGrid>
           </Border>
-          <DataGrid x:Name="DeleteGrid" Grid.Row="1" Style="{StaticResource GridStyle}" AutoGenerateColumns="False" IsReadOnly="True" CanUserAddRows="False" HeadersVisibility="Column" GridLinesVisibility="Horizontal" SelectionMode="Single">
-            <DataGrid.Columns>
-              <DataGridTextColumn Header="Size" Binding="{Binding SizeText, Mode=OneWay}" SortMemberPath="SizeBytes" Width="100" ElementStyle="{StaticResource CellRight}" HeaderStyle="{StaticResource HeaderRight}"/>
-              <DataGridTextColumn Header="What it is" Binding="{Binding Note, Mode=OneWay}" Width="220" ElementStyle="{StaticResource CellWrap}"/>
-              <DataGridTextColumn Header="Folder" Binding="{Binding Path, Mode=OneWay}" Width="*" MinWidth="300" ElementStyle="{StaticResource CellWrap}"/>
-              <DataGridTextColumn Header="Status" Binding="{Binding StatusText, Mode=OneWay}" Width="230" ElementStyle="{StaticResource CellWrap}"/>
-            </DataGrid.Columns>
-          </DataGrid>
-          <Grid Grid.Row="2" Margin="12,10,12,10">
-            <Grid.ColumnDefinitions>
-              <ColumnDefinition Width="Auto"/>
-              <ColumnDefinition Width="*" MinWidth="300"/>
-            </Grid.ColumnDefinitions>
-            <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Top">
-              <Button x:Name="DeleteStoreButton" Content="Send selected to Recycle Bin..." IsEnabled="False" Style="{StaticResource PrimaryButton}" Margin="0,0,16,0"/>
+          <Grid Grid.Row="2" Margin="16,12,16,12">
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <StackPanel Grid.Row="0" Orientation="Horizontal">
+              <Button x:Name="DeleteStoreButton" Content="_Delete (to Recycle Bin)..." Style="{StaticResource PrimaryButton}"/>
             </StackPanel>
-            <TextBlock x:Name="DeleteMessage" Grid.Column="1" TextWrapping="Wrap" VerticalAlignment="Center" FontSize="12.5" Foreground="{StaticResource InkBrush}"/>
+            <TextBlock x:Name="DeleteMessage" Grid.Row="1" Margin="0,8,0,0" Style="{StaticResource ActionMessage}"/>
           </Grid>
         </Grid>
       </TabItem>
 
-      <TabItem Header="Move files to the other drive">
+      <TabItem x:Name="MoveTab" Header="Move files">
         <Grid>
           <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
           </Grid.RowDefinitions>
-          <Border Grid.Row="0" Margin="12,12,12,10" Padding="14,8,14,8" Background="#FFF3D1" BorderBrush="#C8962B" BorderThickness="4,1,1,1" CornerRadius="6">
-            <StackPanel>
-              <TextBlock TextWrapping="Wrap" FontSize="12.5" Foreground="{StaticResource InkBrush}" Text="Large data files (downloads, datasets, videos, archives, model weights). The tool copies the file to the other drive under FromC with the same folder names, reads the copy back and compares it, and only then asks Windows to put the original in the Recycle Bin. Nothing is overwritten. Only plain data file types outside program, application-data and known sync folders are listed. Check that a file is not used by a project or synced to a cloud before moving it."/>
-              <CheckBox x:Name="EnableMoveBox" Content="Allow this tool to move files" IsChecked="False" Margin="0,8,0,0" FontWeight="SemiBold" Foreground="{StaticResource InkBrush}"/>
-            </StackPanel>
+          <TextBlock Grid.Row="0" Style="{StaticResource TabIntro}" Text="Large data files: downloads, datasets, videos, archives, model weights. Moving copies the file to the other drive under FromC with the same folder names, checks the copy against the original, and then sends the original to the Recycle Bin. Nothing is overwritten. The space is free only after you empty the Recycle Bin (button above)."/>
+          <Border Grid.Row="1" BorderBrush="{StaticResource LineBrush}" BorderThickness="0,1,0,1">
+            <DataGrid x:Name="MoveGrid" Style="{StaticResource GridStyle}" AutomationProperties.Name="Files that can be moved">
+              <DataGrid.Columns>
+                <DataGridTextColumn Header="Size" Binding="{Binding SizeText, Mode=OneWay}" SortMemberPath="SizeBytes" Width="96" ElementStyle="{StaticResource CellRight}" HeaderStyle="{StaticResource HeaderRight}"/>
+                <DataGridTextColumn Header="Idle days" Binding="{Binding DaysIdle, Mode=OneWay}" Width="80" ElementStyle="{StaticResource CellRight}" HeaderStyle="{StaticResource HeaderRight}"/>
+                <DataGridTextColumn Header="Status" Binding="{Binding StatusText, Mode=OneWay}" Width="200" ElementStyle="{StaticResource CellWrap}"/>
+                <DataGridTextColumn Header="File" Binding="{Binding Path, Mode=OneWay}" Width="*" MinWidth="224" ElementStyle="{StaticResource CellWrap}"/>
+                <DataGridTextColumn Header="New place" Binding="{Binding Target, Mode=OneWay}" Width="*" MinWidth="224" ElementStyle="{StaticResource CellWrap}"/>
+              </DataGrid.Columns>
+            </DataGrid>
           </Border>
-          <DataGrid x:Name="MoveGrid" Grid.Row="1" Style="{StaticResource GridStyle}" AutoGenerateColumns="False" IsReadOnly="True" CanUserAddRows="False" HeadersVisibility="Column" GridLinesVisibility="Horizontal" SelectionMode="Single">
-            <DataGrid.Columns>
-              <DataGridTextColumn Header="Size" Binding="{Binding SizeText, Mode=OneWay}" SortMemberPath="SizeBytes" Width="100" ElementStyle="{StaticResource CellRight}" HeaderStyle="{StaticResource HeaderRight}"/>
-              <DataGridTextColumn Header="Idle days" Binding="{Binding DaysIdle, Mode=OneWay}" Width="80" ElementStyle="{StaticResource CellRight}" HeaderStyle="{StaticResource HeaderRight}"/>
-              <DataGridTextColumn Header="File" Binding="{Binding Path, Mode=OneWay}" Width="*" MinWidth="230" ElementStyle="{StaticResource CellWrap}"/>
-              <DataGridTextColumn Header="New place" Binding="{Binding Target, Mode=OneWay}" Width="*" MinWidth="230" ElementStyle="{StaticResource CellWrap}"/>
-              <DataGridTextColumn Header="Status" Binding="{Binding StatusText, Mode=OneWay}" Width="200" ElementStyle="{StaticResource CellWrap}"/>
-            </DataGrid.Columns>
-          </DataGrid>
-          <Grid Grid.Row="2" Margin="12,10,12,10">
-            <Grid.ColumnDefinitions>
-              <ColumnDefinition Width="Auto"/>
-              <ColumnDefinition Width="*" MinWidth="300"/>
-            </Grid.ColumnDefinitions>
-            <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Top">
-              <Button x:Name="MoveFileButton" Content="Move selected file..." IsEnabled="False" Style="{StaticResource PrimaryButton}"/>
-              <Button x:Name="MoveCancelButton" Content="Cancel move" IsEnabled="False" Style="{StaticResource PlainButton}" Margin="0,0,16,0"/>
+          <Grid Grid.Row="2" Margin="16,12,16,12">
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <StackPanel Grid.Row="0" Orientation="Horizontal">
+              <Button x:Name="MoveFileButton" Content="_Move this file..." Style="{StaticResource PrimaryButton}"/>
             </StackPanel>
-            <TextBlock x:Name="MoveMessage" Grid.Column="1" TextWrapping="Wrap" VerticalAlignment="Center" FontSize="12.5" Foreground="{StaticResource InkBrush}"/>
+            <TextBlock x:Name="MoveMessage" Grid.Row="1" Margin="0,8,0,0" Style="{StaticResource ActionMessage}"/>
           </Grid>
         </Grid>
       </TabItem>
@@ -2744,33 +3278,40 @@ $script:TriageXaml = @'
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
           </Grid.RowDefinitions>
-          <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="12,10,12,10">
-            <TextBlock Text="Show type" VerticalAlignment="Center" Margin="0,0,10,0" Foreground="{StaticResource MutedBrush}"/>
-            <ComboBox x:Name="BucketFilter" Width="140" Height="28" SelectedIndex="0">
-              <ComboBoxItem Content="All"/>
-              <ComboBoxItem Content="Redirect"/>
-              <ComboBoxItem Content="Delete"/>
-              <ComboBoxItem Content="Move"/>
-              <ComboBoxItem Content="Review"/>
-              <ComboBoxItem Content="Never"/>
-            </ComboBox>
-            <TextBlock x:Name="FilesCountText" Text="" VerticalAlignment="Center" Margin="16,0,0,0" Foreground="{StaticResource MutedBrush}"/>
+          <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="16,12,16,12">
+            <TextBlock Text="Show" VerticalAlignment="Center" Margin="0,0,12,0" Foreground="{StaticResource MutedBrush}"/>
+            <ListBox x:Name="BucketFilter" SelectedIndex="0" Background="Transparent" BorderThickness="0" ItemContainerStyle="{StaticResource FilterItem}" ScrollViewer.HorizontalScrollBarVisibility="Disabled" AutomationProperties.Name="Kind of file to show">
+              <ListBox.ItemsPanel>
+                <ItemsPanelTemplate>
+                  <StackPanel Orientation="Horizontal"/>
+                </ItemsPanelTemplate>
+              </ListBox.ItemsPanel>
+              <ListBoxItem Content="All"/>
+              <ListBoxItem Content="Redirect"/>
+              <ListBoxItem Content="Delete"/>
+              <ListBoxItem Content="Move"/>
+              <ListBoxItem Content="Review"/>
+              <ListBoxItem Content="Never"/>
+            </ListBox>
+            <TextBlock x:Name="FilesCountText" Text="" VerticalAlignment="Center" Margin="12,0,0,0" Foreground="{StaticResource MutedBrush}"/>
           </StackPanel>
-          <DataGrid x:Name="FilesGrid" Grid.Row="1" Style="{StaticResource GridStyle}" AutoGenerateColumns="False" IsReadOnly="True" CanUserAddRows="False" HeadersVisibility="Column" GridLinesVisibility="Horizontal">
-            <DataGrid.Columns>
-              <DataGridTextColumn Header="Size" Binding="{Binding SizeText, Mode=OneWay}" SortMemberPath="SizeBytes" Width="100" ElementStyle="{StaticResource CellRight}" HeaderStyle="{StaticResource HeaderRight}"/>
-              <DataGridTextColumn Header="Type" Binding="{Binding Bucket, Mode=OneWay}" Width="80" ElementStyle="{StaticResource CellBold}"/>
-              <DataGridTextColumn Header="What to do" Binding="{Binding Mechanism, Mode=OneWay}" Width="190" ElementStyle="{StaticResource CellTrim}"/>
-              <DataGridTextColumn Header="Idle days" Binding="{Binding DaysIdle, Mode=OneWay}" Width="80" ElementStyle="{StaticResource CellRight}" HeaderStyle="{StaticResource HeaderRight}"/>
-              <DataGridTextColumn Header="Last write" Binding="{Binding LastWrite, Mode=OneWay}" Width="100" ElementStyle="{StaticResource CellText}"/>
-              <DataGridTextColumn Header="Path" Binding="{Binding Path, Mode=OneWay}" Width="*" MinWidth="240" ElementStyle="{StaticResource CellTrim}"/>
-            </DataGrid.Columns>
-          </DataGrid>
+          <Border Grid.Row="1" BorderBrush="{StaticResource LineBrush}" BorderThickness="0,1,0,0">
+            <DataGrid x:Name="FilesGrid" Style="{StaticResource GridStyle}" AutomationProperties.Name="Largest files">
+              <DataGrid.Columns>
+                <DataGridTextColumn Header="Size" Binding="{Binding SizeText, Mode=OneWay}" SortMemberPath="SizeBytes" Width="96" ElementStyle="{StaticResource CellRight}" HeaderStyle="{StaticResource HeaderRight}"/>
+                <DataGridTextColumn Header="Kind" Binding="{Binding Bucket, Mode=OneWay}" Width="80" ElementStyle="{StaticResource CellBold}"/>
+                <DataGridTextColumn Header="What to do" Binding="{Binding Mechanism, Mode=OneWay}" Width="192" ElementStyle="{StaticResource CellTrim}"/>
+                <DataGridTextColumn Header="Idle days" Binding="{Binding DaysIdle, Mode=OneWay}" Width="80" ElementStyle="{StaticResource CellRight}" HeaderStyle="{StaticResource HeaderRight}"/>
+                <DataGridTextColumn Header="Last write" Binding="{Binding LastWrite, Mode=OneWay}" Width="104" ElementStyle="{StaticResource CellText}"/>
+                <DataGridTextColumn Header="Path" Binding="{Binding Path, Mode=OneWay}" Width="*" MinWidth="240" ElementStyle="{StaticResource CellTrim}"/>
+              </DataGrid.Columns>
+            </DataGrid>
+          </Border>
         </Grid>
       </TabItem>
 
       <TabItem Header="Largest folders">
-        <DataGrid x:Name="FoldersGrid" Style="{StaticResource GridStyle}" AutoGenerateColumns="False" IsReadOnly="True" CanUserAddRows="False" HeadersVisibility="Column" GridLinesVisibility="Horizontal">
+        <DataGrid x:Name="FoldersGrid" Style="{StaticResource GridStyle}" AutomationProperties.Name="Largest folders">
           <DataGrid.Columns>
             <DataGridTextColumn Header="Size" Binding="{Binding SizeText, Mode=OneWay}" SortMemberPath="TotalBytes" Width="120" ElementStyle="{StaticResource CellRight}" HeaderStyle="{StaticResource HeaderRight}"/>
             <DataGridTextColumn Header="Folder" Binding="{Binding Folder, Mode=OneWay}" Width="*" MinWidth="240" ElementStyle="{StaticResource CellTrim}"/>
@@ -2784,65 +3325,37 @@ $script:TriageXaml = @'
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
           </Grid.RowDefinitions>
-          <TextBlock Grid.Row="0" Margin="12,10,12,10" TextWrapping="Wrap" Foreground="{StaticResource MutedBrush}" Text="This tool does not measure these items because they need administrator rights. Check each one yourself."/>
-          <DataGrid x:Name="ElevatedGrid" Grid.Row="1" Style="{StaticResource GridStyle}" AutoGenerateColumns="False" IsReadOnly="True" CanUserAddRows="False" HeadersVisibility="Column" GridLinesVisibility="Horizontal">
-            <DataGrid.Columns>
-              <DataGridTextColumn Header="Item" Binding="{Binding Item, Mode=OneWay}" Width="220" ElementStyle="{StaticResource CellWrap}"/>
-              <DataGridTextColumn Header="Action" Binding="{Binding Action, Mode=OneWay}" Width="*" MinWidth="240" ElementStyle="{StaticResource CellWrap}"/>
-            </DataGrid.Columns>
-          </DataGrid>
+          <TextBlock Grid.Row="0" Style="{StaticResource TabIntro}" Text="This tool does not measure these items because they need administrator rights. Check each one yourself."/>
+          <Border Grid.Row="1" BorderBrush="{StaticResource LineBrush}" BorderThickness="0,1,0,0">
+            <DataGrid x:Name="ElevatedGrid" Style="{StaticResource GridStyle}" AutomationProperties.Name="Items that need administrator rights">
+              <DataGrid.Columns>
+                <DataGridTextColumn Header="Item" Binding="{Binding Item, Mode=OneWay}" Width="224" ElementStyle="{StaticResource CellWrap}"/>
+                <DataGridTextColumn Header="Where to change it" Binding="{Binding Action, Mode=OneWay}" Width="*" MinWidth="240" ElementStyle="{StaticResource CellWrap}"/>
+              </DataGrid.Columns>
+            </DataGrid>
+          </Border>
         </Grid>
       </TabItem>
     </TabControl>
 
-    <!-- Row 4: status bar -->
-    <Border Grid.Row="4" Margin="0,12,0,0" Background="{StaticResource SurfaceBrush}" BorderBrush="{StaticResource LineBrush}" BorderThickness="0,1,0,0" Padding="24,6,24,6">
-      <Grid>
-        <Grid.ColumnDefinitions>
-          <ColumnDefinition Width="Auto"/>
-          <ColumnDefinition Width="Auto"/>
-          <ColumnDefinition Width="Auto"/>
-          <ColumnDefinition Width="*"/>
-          <ColumnDefinition Width="Auto"/>
-        </Grid.ColumnDefinitions>
-        <TextBlock x:Name="RootsText" Grid.Column="0" Text="Scanned roots: 0" VerticalAlignment="Center" Margin="0,0,24,0" FontSize="12" Foreground="{StaticResource MutedBrush}"/>
-        <TextBlock x:Name="DeniedText" Grid.Column="1" Text="Unreadable locations skipped: 0" VerticalAlignment="Center" Margin="0,0,24,0" FontSize="12" Foreground="{StaticResource MutedBrush}"/>
-        <TextBlock Grid.Column="2" Text="Last export" VerticalAlignment="Center" Margin="0,0,8,0" FontSize="12" Foreground="{StaticResource MutedBrush}"/>
-        <TextBox x:Name="ExportPathBox" Grid.Column="3" IsReadOnly="True" Height="26" VerticalContentAlignment="Center" BorderBrush="{StaticResource LineBrush}" Background="#F6F8F9" Margin="0,0,8,0"/>
-        <Button x:Name="CopyPathButton" Grid.Column="4" Content="Copy path" Style="{StaticResource PlainButton}" Height="26" MinWidth="84" Margin="0" Padding="12,0,12,0"/>
-      </Grid>
-    </Border>
+    <!-- Row 5: status bar -->
+    <Grid Grid.Row="5" Margin="24,8,24,12">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="Auto"/>
+        <ColumnDefinition Width="Auto"/>
+        <ColumnDefinition Width="Auto"/>
+        <ColumnDefinition Width="*"/>
+        <ColumnDefinition Width="Auto"/>
+      </Grid.ColumnDefinitions>
+      <TextBlock x:Name="RootsText" Grid.Column="0" Text="Scanned roots: 0" VerticalAlignment="Center" Margin="0,0,24,0" FontSize="12" Foreground="{StaticResource MutedBrush}"/>
+      <TextBlock x:Name="DeniedText" Grid.Column="1" Text="Skipped: 0" VerticalAlignment="Center" Margin="0,0,24,0" FontSize="12" Foreground="{StaticResource MutedBrush}"/>
+      <TextBlock Grid.Column="2" Text="Last report" VerticalAlignment="Center" Margin="0,0,8,0" FontSize="12" Foreground="{StaticResource MutedBrush}"/>
+      <TextBox x:Name="ExportPathBox" Grid.Column="3" IsReadOnly="True" Height="28" FontSize="12" Style="{StaticResource FieldBox}" Margin="0,0,8,0" AutomationProperties.Name="Where the last report was saved"/>
+      <Button x:Name="CopyPathButton" Grid.Column="4" Content="Copy path" Style="{StaticResource PlainButton}" Height="28" MinWidth="80" Margin="0"/>
+    </Grid>
   </Grid>
 </Window>
 '@
-
-function Initialize-TriageGui {
-    Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
-}
-
-function Get-TriageControlNames {
-    return @(
-        'SourceDriveLabel', 'SourceDriveBar', 'SourceDriveStatus',
-        'DestDriveLabel', 'DestDriveBar', 'DestDriveStatus',
-        'SourceBox', 'DestBox', 'MinSizeBox',
-        'ScanButton', 'CancelButton', 'ExportButton', 'ProgressText',
-        'RedirectSize', 'RedirectFiles', 'DeleteSize', 'DeleteFiles', 'MoveSize', 'MoveFiles',
-        'MainTabs', 'MechanismsGrid', 'BucketFilter', 'FilesCountText', 'FilesGrid', 'FoldersGrid', 'ElevatedGrid',
-        'RootsText', 'DeniedText', 'ExportPathBox', 'CopyPathButton',
-        'ExtraRootsBox', 'EnableActionsBox', 'RedirectGrid', 'ApplyRedirectButton', 'UndoRedirectButton', 'RedirectMessage',
-        'EnableDeleteBox', 'DeleteGrid', 'DeleteStoreButton', 'DeleteMessage',
-        'EnableMoveBox', 'MoveGrid', 'MoveFileButton', 'MoveCancelButton', 'MoveMessage'
-    )
-}
-
-function New-TriageWindow {
-    $window = [System.Windows.Markup.XamlReader]::Parse($script:TriageXaml)
-    $controls = @{}
-    foreach ($name in (Get-TriageControlNames)) {
-        $controls[$name] = $window.FindName($name)
-    }
-    return @{ Window = $window; Controls = $controls }
-}
 
 function Get-TriageStatusBrush {
     param($Window, [string]$Status)
@@ -2883,21 +3396,6 @@ function Set-TriageDriveBlock {
     $BarCtl.Foreground = $brush
 }
 
-function Set-TriageCard {
-    param($Result, [string]$Bucket, $SizeCtl, $FilesCtl)
-    $entry = $null
-    foreach ($b in @($Result.Buckets)) {
-        if ([string]$b.Bucket -eq $Bucket) { $entry = $b }
-    }
-    if ($null -eq $entry) {
-        $SizeCtl.Text = Format-Size -Bytes 0.0
-        $FilesCtl.Text = '0 files'
-        return
-    }
-    $SizeCtl.Text = Format-Size -Bytes ([double]$entry.TotalBytes)
-    $FilesCtl.Text = ('{0:N0} files' -f [long]$entry.Files)
-}
-
 function Get-TriageSelectedBucket {
     param([hashtable]$Ui)
     $item = $Ui.Controls['BucketFilter'].SelectedItem
@@ -2926,91 +3424,6 @@ function Set-TriageFilesGrid {
     $Ui.Controls['FilesCountText'].Text = ('Showing {0:N0} of {1:N0} files' -f $rows.Count, $total)
 }
 
-function Update-TriageRedirectButtons {
-    param([Parameter(Mandatory = $true)][hashtable]$Ui)
-    $c = $Ui.Controls
-    $on = ($c['EnableActionsBox'].IsChecked -eq $true) -and (-not $script:TriageScanning) -and (-not $script:TriageBusy)
-    $canApply = $false
-    $selected = $c['RedirectGrid'].SelectedItem
-    if ($on -and $null -ne $selected) {
-        if ([string]$selected.State -eq 'Ready') { $canApply = $true }
-    }
-    $canUndo = $false
-    if ($on -and $null -ne $script:TriageRedirectHistory -and $script:TriageRedirectHistory.Count -gt 0) { $canUndo = $true }
-    $c['ApplyRedirectButton'].IsEnabled = $canApply
-    $c['UndoRedirectButton'].IsEnabled = $canUndo
-}
-
-function Update-TriageRedirectGrid {
-    param(
-        [Parameter(Mandatory = $true)][hashtable]$Ui,
-        [Parameter(Mandatory = $true)]$Result
-    )
-    $c = $Ui.Controls
-    $plan = @()
-    $problem = ''
-    try {
-        $plan = @(Get-TriageRedirectPlan -Result $Result)
-    }
-    catch {
-        $plan = @()
-        $problem = $_.Exception.Message
-    }
-    $script:TriageRedirectPlan = $plan
-
-    $rows = New-Object 'System.Collections.ObjectModel.ObservableCollection[object]'
-    foreach ($p in $plan) {
-        $state = [string]$p.State
-        $reason = [string]$p.Reason
-        $status = $state
-        if ($state -eq 'Ready') {
-            $status = 'Ready'
-            if ($reason.Length -gt 0) { $status = 'Ready (' + $reason + ')' }
-        }
-        elseif ($state -eq 'AlreadySet') {
-            $status = 'Already set: ' + [string]$p.CurrentValue
-        }
-        elseif ($state -eq 'Blocked') {
-            $status = 'Not possible: ' + $reason
-        }
-        $rows.Add([pscustomobject]@{
-            Variable      = [string]$p.Variable
-            SizeText      = (Format-Size -Bytes ([double]$p.SizeBytes))
-            SizeBytes     = [long]$p.SizeBytes
-            ProposedValue = [string]$p.ProposedValue
-            Effect        = [string]$p.Effect
-            OldFolder     = [string]$p.OldFolder
-            SourceFolder  = [string]$p.SourceFolder
-            State         = $state
-            StatusText    = $status
-            Reason        = $reason
-            CurrentValue  = [string]$p.CurrentValue
-        })
-    }
-    $c['RedirectGrid'].ItemsSource = $rows
-    if ($plan.Count -eq 0) {
-        if ($problem.Length -gt 0) {
-            $c['RedirectMessage'].Text = ('Could not work out the possible fixes: ' + $problem)
-        }
-        else {
-            $c['RedirectMessage'].Text = 'The scan found no cache that one setting can redirect.'
-        }
-    }
-    Update-TriageRedirectButtons -Ui $Ui
-}
-
-function Update-TriageDeleteButtons {
-    param([Parameter(Mandatory = $true)][hashtable]$Ui)
-    $c = $Ui.Controls
-    $on = ($c['EnableDeleteBox'].IsChecked -eq $true) -and (-not $script:TriageScanning) -and (-not $script:TriageBusy)
-    $canDelete = $false
-    $selected = $c['DeleteGrid'].SelectedItem
-    if ($on -and $null -ne $selected) {
-        if ([string]$selected.State -eq 'Ready') { $canDelete = $true }
-    }
-    $c['DeleteStoreButton'].IsEnabled = $canDelete
-}
-
 function Set-TriageDeleteRows {
     param([Parameter(Mandatory = $true)][hashtable]$Ui)
     $rows = New-Object 'System.Collections.ObjectModel.ObservableCollection[object]'
@@ -3036,46 +3449,6 @@ function Set-TriageDeleteRows {
         })
     }
     $Ui.Controls['DeleteGrid'].ItemsSource = $rows
-}
-
-function Update-TriageDeleteGrid {
-    param(
-        [Parameter(Mandatory = $true)][hashtable]$Ui,
-        [Parameter(Mandatory = $true)]$Result
-    )
-    $c = $Ui.Controls
-    $plan = @()
-    $problem = ''
-    try {
-        $plan = @(Get-TriageDeletePlan -Result $Result)
-    }
-    catch {
-        $plan = @()
-        $problem = $_.Exception.Message
-    }
-    $script:TriageDeletePlan = $plan
-    Set-TriageDeleteRows -Ui $Ui
-    if ($plan.Count -eq 0) {
-        if ($problem.Length -gt 0) {
-            $c['DeleteMessage'].Text = ('Could not work out which folders can be removed: ' + $problem)
-        }
-        else {
-            $c['DeleteMessage'].Text = 'The scan found no folder the tool can remove safely.'
-        }
-    }
-    Update-TriageDeleteButtons -Ui $Ui
-}
-
-function Update-TriageMoveButtons {
-    param([Parameter(Mandatory = $true)][hashtable]$Ui)
-    $c = $Ui.Controls
-    $on = ($c['EnableMoveBox'].IsChecked -eq $true) -and (-not $script:TriageScanning) -and (-not $script:TriageBusy)
-    $canMove = $false
-    $selected = $c['MoveGrid'].SelectedItem
-    if ($on -and $null -ne $selected) {
-        if ([string]$selected.State -eq 'Ready') { $canMove = $true }
-    }
-    $c['MoveFileButton'].IsEnabled = $canMove
 }
 
 function Set-TriageMoveRows {
@@ -3106,6 +3479,441 @@ function Set-TriageMoveRows {
     $Ui.Controls['MoveGrid'].ItemsSource = $rows
 }
 
+function Invoke-TriageGuiScan {
+    $ui = $script:TriageUi
+    $c = $ui.Controls
+    $caption = 'Disk Space Triage'
+    $src = ([string]$c['SourceBox'].Text).Trim()
+    $dst = ([string]$c['DestBox'].Text).Trim()
+    $minText = ([string]$c['MinSizeBox'].Text).Trim()
+
+    if ($script:TriageBusy) {
+        $c['ProgressText'].Text = 'Wait until the current action has finished.'
+        return
+    }
+
+    if ($src -notmatch '^[A-Za-z]$') {
+        [void][System.Windows.MessageBox]::Show('The drive to free up must be a single letter, for example C.', $caption, [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+        return
+    }
+    if ($dst -notmatch '^[A-Za-z]$') {
+        [void][System.Windows.MessageBox]::Show('The drive to move things to must be a single letter, for example D.', $caption, [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+        return
+    }
+    if ($src.ToUpper() -eq $dst.ToUpper()) {
+        [void][System.Windows.MessageBox]::Show('The two drives must be different.', $caption, [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+        return
+    }
+    if ($minText -notmatch '^[0-9]{1,7}$' -or [int]$minText -lt 1 -or [int]$minText -gt 1048576) {
+        [void][System.Windows.MessageBox]::Show('The smallest file size to list must be a whole number of megabytes between 1 and 1048576.', $caption, [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+        return
+    }
+    $minMb = [int]$minText
+
+    $extraRoots = @()
+    foreach ($part in (([string]$c['ExtraRootsBox'].Text) -split ';')) {
+        $trimmed = ([string]$part).Trim().Trim('"').Trim()
+        if ($trimmed.Length -gt 0) { $extraRoots += $trimmed }
+    }
+    foreach ($folder in $extraRoots) {
+        if (-not $folder.StartsWith($src + ':\', [System.StringComparison]::OrdinalIgnoreCase)) {
+            [void][System.Windows.MessageBox]::Show(('Extra folders must be full paths on the source drive, for example ' + $src.ToUpper() + ':\ComfyUI. Not valid: ' + $folder), $caption, [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+            return
+        }
+    }
+    $scanRoots = @()
+    foreach ($root in @($script:TriageGuiRoots)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$root)) { $scanRoots += [string]$root }
+    }
+    $scanRoots = @($scanRoots + $extraRoots)
+    $srcLetter = [char]$src.ToUpper()
+    $dstLetter = [char]$dst.ToUpper()
+
+    $script:TriageCancel = $false
+    # Nothing else may be started while the scan runs.
+    $script:TriageScanning = $true
+    Update-TriageAllActionButtons -Ui $ui
+    $c['ProgressText'].Text = 'Scanning (read-only). The other buttons are paused until this has finished.'
+
+    $onProgress = {
+        param($dirsScanned, $bytesSeen, $currentPath)
+        if (($dirsScanned % 50) -eq 0) {
+            $p = [string]$currentPath
+            if ($p.Length -gt 70) { $p = '...' + $p.Substring($p.Length - 67) }
+            $t = ('Scanning: {0:N0} folders, {1} seen. {2}' -f $dirsScanned, (Format-Size -Bytes ([double]$bytesSeen)), $p)
+            $script:TriageUi.Controls['ProgressText'].Text = $t
+            $script:TriageUi.Window.Dispatcher.Invoke([System.Action]{ }, [System.Windows.Threading.DispatcherPriority]::Background)
+        }
+    }
+
+    try {
+        $result = Invoke-TriageScan -SourceDrive $srcLetter -DestinationDrive $dstLetter -MinSizeMB $minMb -OnProgress $onProgress `
+            -AdditionalRoot $scanRoots -SkipDefaultRoots:$script:TriageGuiSkipDefault
+        $script:TriageLastResult = $result
+        Update-TriageWindow -Ui $ui -Result $result
+        Update-TriageSpaceBar -Ui $ui
+        if ($result.Cancelled) {
+            $c['ProgressText'].Text = 'Cancelled. Showing partial results. Scan again to see everything.'
+        }
+        else {
+            $c['ProgressText'].Text = ('Done. {0:N0} files scanned, {1} seen. Nothing was changed. Next: open Move caches, Delete or Move files, select a row and choose its button.' -f [long]$result.ScannedFiles, (Format-Size -Bytes ([double]$result.ScannedBytes)))
+        }
+    }
+    catch {
+        $msg = $_.Exception.Message
+        $c['ProgressText'].Text = 'Scan failed.'
+        [void][System.Windows.MessageBox]::Show(('The scan failed: ' + $msg), $caption, [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+    }
+    finally {
+        $script:TriageScanning = $false
+        Update-TriageAllActionButtons -Ui $ui
+    }
+}
+
+function Invoke-TriageGuiExport {
+    $ui = $script:TriageUi
+    $c = $ui.Controls
+    $caption = 'Disk Space Triage'
+    if ($null -eq $script:TriageLastResult) {
+        [void][System.Windows.MessageBox]::Show('Nothing to save yet: choose Scan first, then Save report.', $caption, [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
+        return
+    }
+    try {
+        $exported = Export-TriageReport -Result $script:TriageLastResult -Directory $script:TriageGuiReportDir
+        $c['ExportPathBox'].Text = [string]$exported.Html
+        $c['ProgressText'].Text = 'Report saved. Open the HTML file shown at the bottom of the window.'
+    }
+    catch {
+        $msg = $_.Exception.Message
+        [void][System.Windows.MessageBox]::Show(('Export failed: ' + $msg), $caption, [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
+    }
+}
+
+function Invoke-TriageGuiCopyPath {
+    $ui = $script:TriageUi
+    $text = [string]$ui.Controls['ExportPathBox'].Text
+    if ($text.Length -eq 0) { return }
+    try {
+        [System.Windows.Clipboard]::SetText($text)
+    }
+    catch {
+        $msg = $_.Exception.Message
+        [void][System.Windows.MessageBox]::Show(('Could not copy to the clipboard: ' + $msg), 'Disk Space Triage', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
+    }
+}
+
+function Save-TriageWindowPng {
+    # Self-test only: the one place a file stream is created.
+    param($Root, [string]$Path)
+    $bmp = New-Object System.Windows.Media.Imaging.RenderTargetBitmap -ArgumentList @(1100, 700, 96.0, 96.0, [System.Windows.Media.PixelFormats]::Pbgra32)
+    $bmp.Render($Root)
+    $encoder = New-Object System.Windows.Media.Imaging.PngBitmapEncoder
+    $encoder.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($bmp))
+    $stream = [System.IO.File]::Create($Path)
+    try {
+        $encoder.Save($stream)
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
+function Initialize-TriageGui {
+    Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+}
+
+function Get-TriageControlNames {
+    return @(
+        'SourceDriveLabel', 'SourceDriveBar', 'SourceDriveStatus',
+        'DestDriveLabel', 'DestDriveBar', 'DestDriveStatus',
+        'SourceBox', 'DestBox', 'MinSizeBox', 'ExtraRootsBox',
+        'ScanButton', 'CancelButton', 'ExportButton', 'ProgressText', 'BusyBar',
+        'RecycleText', 'SessionText', 'EmptyBinButton', 'SummaryButton',
+        'MainTabs', 'MechanismsGrid', 'BucketFilter', 'FilesCountText', 'FilesGrid', 'FoldersGrid', 'ElevatedGrid',
+        'RootsText', 'DeniedText', 'ExportPathBox', 'CopyPathButton',
+        'RedirectTab', 'RedirectGrid', 'MoveStoreButton', 'ApplyRedirectButton', 'UndoRedirectButton', 'RedirectMessage',
+        'DeleteTab', 'DeleteGrid', 'DeleteStoreButton', 'DeleteMessage',
+        'MoveTab', 'MoveGrid', 'MoveFileButton', 'MoveMessage'
+    )
+}
+
+function Get-TriageTheme {
+    # 'Light', 'Dark' or 'Contrast', following Windows. Reads one per-user
+    # setting (the only registry value this script ever reads) and changes
+    # nothing.
+    try {
+        if ([System.Windows.SystemParameters]::HighContrast) { return 'Contrast' }
+    } catch { Write-Verbose ('High-contrast state unavailable: ' + $_.Exception.Message) }
+    try {
+        $light = [Microsoft.Win32.Registry]::GetValue('HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize', 'AppsUseLightTheme', 1)
+        if ($null -ne $light -and [int]$light -eq 0) { return 'Dark' }
+    } catch { Write-Verbose ('App theme unavailable: ' + $_.Exception.Message) }
+    return 'Light'
+}
+
+function Get-TriagePalette {
+    # Colour values for the tokens in the window definition.
+    param([string]$Theme)
+    if ($Theme -eq 'Dark') {
+        return @{
+            Bg = '#202020'; Surface = '#2B2B2B'; Subtle = '#323232'; Ink = '#FFFFFF'; Muted = '#C8C8C8'; Line = '#3D3D3D'
+            Control = '#373737'; ControlLine = '#9A9A9A'; Hover = '#3A3A3A'; Selected = '#17405F'; SelectedInk = '#FFFFFF'
+            Track = '#4A4A4A'; Accent = '#60CDFF'; AccentHover = '#8AD9FF'; OnAccent = '#000000'
+            Disabled = '#343434'; DisabledInk = '#8C8C8C'; Notice = '#433519'; NoticeLine = '#6B5521'; Scroll = '#8A8A8A'
+            Critical = '#FF99A4'; Low = '#FFB37A'; Warning = '#FCE100'; Healthy = '#6CCB5F'
+        }
+    }
+    if ($Theme -eq 'Contrast') {
+        $window = [System.Windows.SystemColors]::WindowColor.ToString()
+        $text   = [System.Windows.SystemColors]::WindowTextColor.ToString()
+        $high   = [System.Windows.SystemColors]::HighlightColor.ToString()
+        $onHigh = [System.Windows.SystemColors]::HighlightTextColor.ToString()
+        $gray   = [System.Windows.SystemColors]::GrayTextColor.ToString()
+        return @{
+            Bg = $window; Surface = $window; Subtle = $window; Ink = $text; Muted = $text; Line = $text
+            Control = $window; ControlLine = $text; Hover = $window; Selected = $high; SelectedInk = $onHigh
+            Track = $window; Accent = $high; AccentHover = $high; OnAccent = $onHigh
+            Disabled = $window; DisabledInk = $gray; Notice = $window; NoticeLine = $text; Scroll = $text
+            Critical = $text; Low = $text; Warning = $text; Healthy = $text
+        }
+    }
+    return @{
+        Bg = '#F3F3F3'; Surface = '#FFFFFF'; Subtle = '#FAFAFA'; Ink = '#1B1B1B'; Muted = '#5C5C5C'; Line = '#E0E0E0'
+        Control = '#FFFFFF'; ControlLine = '#868686'; Hover = '#EDEDED'; Selected = '#DCEBF8'; SelectedInk = '#1B1B1B'
+        Track = '#DADADA'; Accent = '#005FB8'; AccentHover = '#1A70C2'; OnAccent = '#FFFFFF'
+        Disabled = '#EAEAEA'; DisabledInk = '#767676'; Notice = '#FFF4CE'; NoticeLine = '#E6C877'; Scroll = '#8A8A8A'
+        Critical = '#C42B1C'; Low = '#A8480B'; Warning = '#7A5C00'; Healthy = '#0F7B0F'
+    }
+}
+
+function New-TriageWindow {
+    param([string]$Theme)
+    if ([string]::IsNullOrEmpty($Theme)) { $Theme = Get-TriageTheme }
+    $palette = Get-TriagePalette -Theme $Theme
+    $xaml = $script:TriageXaml
+    foreach ($key in @($palette.Keys)) {
+        $colour = [string]$palette[$key]
+        if ($colour -notmatch '^#[0-9A-Fa-f]{6,8}$') { throw "Not a colour value for ${key}: $colour" }
+        $xaml = $xaml.Replace('@' + $key + '@', $colour)
+    }
+    $window = [System.Windows.Markup.XamlReader]::Parse($xaml)
+    $controls = @{}
+    foreach ($name in (Get-TriageControlNames)) {
+        $controls[$name] = $window.FindName($name)
+    }
+    return @{ Window = $window; Controls = $controls; Theme = $Theme }
+}
+
+function Get-TriageBucketBytes {
+    param($Result, [string]$Bucket)
+    foreach ($b in @($Result.Buckets)) {
+        if ([string]$b.Bucket -eq $Bucket) { return [double]$b.TotalBytes }
+    }
+    return 0.0
+}
+
+function Get-TriageRowStatus {
+    # The words shown in a Status column.
+    param([string]$State, [string]$Reason, [string]$Current)
+    if ($State -eq 'Ready') {
+        if ($Reason.Length -gt 0) { return 'Ready (' + $Reason + ')' }
+        return 'Ready'
+    }
+    if ($State -eq 'AlreadySet') { return 'Setting already points to ' + $Current }
+    if ($State -eq 'Blocked') { return 'Not possible: ' + $Reason }
+    return $State
+}
+
+function Update-TriageAllActionButtons {
+    # No button is ever switched off because of what is selected: a button
+    # that cannot act says why when it is chosen. Buttons pause only while a
+    # scan or an action is running, and the status line says so.
+    param([Parameter(Mandatory = $true)][hashtable]$Ui)
+    $c = $Ui.Controls
+    $idle = (-not $script:TriageScanning) -and (-not $script:TriageBusy)
+    foreach ($name in @('ScanButton', 'ExportButton', 'EmptyBinButton', 'SummaryButton', 'MoveStoreButton', 'ApplyRedirectButton', 'UndoRedirectButton', 'DeleteStoreButton', 'MoveFileButton')) {
+        $c[$name].IsEnabled = $idle
+    }
+    $c['CancelButton'].IsEnabled = (-not $idle)
+}
+
+function Set-TriageBusy {
+    # Marks the start or the end of an action that blocks the other buttons.
+    param([Parameter(Mandatory = $true)][hashtable]$Ui, [bool]$Busy, [string]$Text)
+    $script:TriageBusy = $Busy
+    $c = $Ui.Controls
+    $c['BusyBar'].Value = 0
+    if ($Busy) {
+        $c['BusyBar'].Visibility = 'Visible'
+        $c['ProgressText'].Text = $Text + ' The other buttons are paused until this has finished.'
+    } else {
+        $c['BusyBar'].Visibility = 'Hidden'
+        if ($Text.Length -gt 0) { $c['ProgressText'].Text = $Text }
+    }
+    Update-TriageAllActionButtons -Ui $Ui
+    $Ui.Window.Dispatcher.Invoke([System.Action]{ }, [System.Windows.Threading.DispatcherPriority]::Background)
+}
+
+function Get-TriageSourceLetter {
+    # The drive the window is working on: the scanned one, else the box.
+    param([Parameter(Mandatory = $true)][hashtable]$Ui)
+    if ($null -ne $script:TriageLastResult -and $null -ne $script:TriageLastResult.Source) { return [string]$script:TriageLastResult.Source.Letter }
+    $text = ([string]$Ui.Controls['SourceBox'].Text).Trim()
+    if ($text -match '^[A-Za-z]$') { return $text.ToUpper() }
+    return ''
+}
+
+function Update-TriageSpaceBar {
+    # Free space, Recycle Bin contents and the change since the window opened.
+    param([Parameter(Mandatory = $true)][hashtable]$Ui)
+    $c = $Ui.Controls
+    $letter = Get-TriageSourceLetter -Ui $Ui
+    if ($letter -eq '') {
+        $c['RecycleText'].Text = 'Recycle Bin: enter a drive letter first.'
+        return
+    }
+    $now = Get-TriageSpaceSnapshot -Letter $letter
+    if ($null -eq $script:TriageSessionStart -or [string]$script:TriageSessionStart.Letter -ne $letter) { $script:TriageSessionStart = $now }
+    $script:TriageSpaceNow = $now
+
+    if ($now.FreeBytes -lt 0) {
+        $c['RecycleText'].Text = ('Drive {0}: is not available.' -f $letter)
+    } elseif (-not $now.BinKnown) {
+        $c['RecycleText'].Text = ('The Recycle Bin on {0}: could not be read. Deleted items still take space until it is emptied.' -f $letter)
+    } elseif ($now.BinItems -le 0) {
+        $c['RecycleText'].Text = ('The Recycle Bin on {0}: is empty. Nothing is waiting to be freed.' -f $letter)
+    } else {
+        $c['RecycleText'].Text = ('The Recycle Bin on {0}: holds {1} in {2:N0} item(s). That space is NOT free until you empty it.' -f $letter, (Format-Size -Bytes ([double]$now.BinBytes)), $now.BinItems)
+    }
+
+    $start = $script:TriageSessionStart
+    if ($start.FreeBytes -ge 0 -and $now.FreeBytes -ge 0) {
+        $delta = [double]($now.FreeBytes - $start.FreeBytes)
+        $sign = '+'
+        if ($delta -lt 0) { $sign = '-'; $delta = -$delta }
+        $c['SessionText'].Text = ('Free on {0}: {1} when this window opened, {2} now ({3}{4}).' -f $letter, (Format-Size -Bytes ([double]$start.FreeBytes)), (Format-Size -Bytes ([double]$now.FreeBytes)), $sign, (Format-Size -Bytes $delta))
+    }
+
+    # Keep the gauge at the top in step with the real figure.
+    $facts = Get-DriveFacts -Letter $letter
+    if ($null -ne $facts) {
+        Set-TriageDriveBlock -Window $Ui.Window -LabelCtl $c['SourceDriveLabel'] -BarCtl $c['SourceDriveBar'] -StatusCtl $c['SourceDriveStatus'] -Facts $facts -Status ([string](Get-PressureStatus -Facts $facts)) -MissingText 'Drive not found'
+    }
+    $destText = ([string]$c['DestBox'].Text).Trim()
+    if ($destText -match '^[A-Za-z]$') {
+        $destFacts = Get-DriveFacts -Letter $destText.ToUpper()
+        $destStatus = 'UNKNOWN'
+        if ($null -ne $destFacts) { $destStatus = [string](Get-PressureStatus -Facts $destFacts) }
+        Set-TriageDriveBlock -Window $Ui.Window -LabelCtl $c['DestDriveLabel'] -BarCtl $c['DestDriveBar'] -StatusCtl $c['DestDriveStatus'] -Facts $destFacts -Status $destStatus -MissingText 'Drive not found'
+    }
+}
+
+function Add-TriageSessionRecord {
+    # Remembers one finished action for the summary (sizes only, no paths).
+    param($Record, [string]$Action)
+    $before = $null; $after = $null; $size = [long]0
+    $names = @($Record.PSObject.Properties.Name)
+    if ($names -contains 'Before') { $before = $Record.Before }
+    if ($names -contains 'After')  { $after  = $Record.After }
+    if ($names -contains 'SizeBytes') { $size = [long]$Record.SizeBytes }
+    $script:TriageSession.Add([pscustomobject]@{ Action = $Action; SizeBytes = $size; Before = $before; After = $after })
+}
+
+function Get-TriageOutcomeTail {
+    # What every action message ends with: the measured free space, what is
+    # still waiting in the Recycle Bin, and where the change was logged.
+    param($Record)
+    $tail = ''
+    $names = @($Record.PSObject.Properties.Name)
+    if ($names -contains 'Space' -and ([string]$Record.Space).Length -gt 0) { $tail = ' ' + [string]$Record.Space }
+    if ($names -contains 'After' -and $null -ne $Record.After -and $Record.After.BinKnown -and $Record.After.BinBytes -gt 0) {
+        $tail = $tail + ' To really free that space, choose Empty Recycle Bin above.'
+    }
+    if (([string]$Record.LogPath).Length -gt 0) {
+        $tail = $tail + ' Logged in ' + [string]$Record.LogPath
+    } else {
+        $tail = $tail + ' Note: this could NOT be written to the change log (is the file open in another program?).'
+    }
+    return $tail
+}
+
+function Update-TriageRedirectGrid {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Ui,
+        [Parameter(Mandatory = $true)]$Result
+    )
+    $c = $Ui.Controls
+    $plan = @()
+    $problem = ''
+    try {
+        $plan = @(Get-TriageRedirectPlan -Result $Result)
+    }
+    catch {
+        $plan = @()
+        $problem = $_.Exception.Message
+    }
+    $script:TriageRedirectPlan = $plan
+
+    $rows = New-Object 'System.Collections.ObjectModel.ObservableCollection[object]'
+    foreach ($p in $plan) {
+        # The Status column answers "can this store move?", which is what frees space.
+        $status = Get-TriageRowStatus -State ([string]$p.MoveState) -Reason ([string]$p.MoveReason) -Current ([string]$p.CurrentValue)
+        if ([string]$p.MoveState -ne 'Ready' -and [string]$p.State -eq 'AlreadySet') {
+            $status = 'Setting already points to ' + [string]$p.CurrentValue + '. ' + [string]$p.MoveReason
+        }
+        $rows.Add([pscustomobject]@{
+            Variable      = [string]$p.Variable
+            SizeText      = (Format-Size -Bytes ([double]$p.SizeBytes))
+            SizeBytes     = [long]$p.SizeBytes
+            ProposedValue = [string]$p.ProposedValue
+            Effect        = [string]$p.Effect
+            StatusText    = $status
+        })
+    }
+    $c['RedirectGrid'].ItemsSource = $rows
+    if ($plan.Count -eq 0) {
+        if ($problem.Length -gt 0) {
+            $c['RedirectMessage'].Text = ('Could not work out which stores can move: ' + $problem)
+        }
+        else {
+            $c['RedirectMessage'].Text = 'The scan found no cache or model store that this tool can move.'
+        }
+    }
+    elseif (([string]$c['RedirectMessage'].Text).Length -eq 0) {
+        $c['RedirectMessage'].Text = 'Select a row marked Ready, then choose Move to the other drive. You are asked to confirm before anything happens.'
+    }
+}
+
+function Update-TriageDeleteGrid {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Ui,
+        [Parameter(Mandatory = $true)]$Result
+    )
+    $c = $Ui.Controls
+    $plan = @()
+    $problem = ''
+    try {
+        $plan = @(Get-TriageDeletePlan -Result $Result)
+    }
+    catch {
+        $plan = @()
+        $problem = $_.Exception.Message
+    }
+    $script:TriageDeletePlan = $plan
+    Set-TriageDeleteRows -Ui $Ui
+    if ($plan.Count -eq 0) {
+        if ($problem.Length -gt 0) {
+            $c['DeleteMessage'].Text = ('Could not work out which folders can be deleted: ' + $problem)
+        }
+        else {
+            $c['DeleteMessage'].Text = 'The scan found no folder the tool can delete safely.'
+        }
+    }
+    elseif (([string]$c['DeleteMessage'].Text).Length -eq 0) {
+        $c['DeleteMessage'].Text = 'Select a row marked Ready, then choose Delete. You are asked to confirm before anything happens.'
+    }
+}
+
 function Update-TriageMoveGrid {
     param(
         [Parameter(Mandatory = $true)][hashtable]$Ui,
@@ -3131,14 +3939,9 @@ function Update-TriageMoveGrid {
             $c['MoveMessage'].Text = 'The scan found no file the tool can move.'
         }
     }
-    Update-TriageMoveButtons -Ui $Ui
-}
-
-function Update-TriageAllActionButtons {
-    param([Parameter(Mandatory = $true)][hashtable]$Ui)
-    Update-TriageRedirectButtons -Ui $Ui
-    Update-TriageDeleteButtons -Ui $Ui
-    Update-TriageMoveButtons -Ui $Ui
+    elseif (([string]$c['MoveMessage'].Text).Length -eq 0) {
+        $c['MoveMessage'].Text = 'Select a row marked Ready, then choose Move this file. You are asked to confirm before anything happens.'
+    }
 }
 
 function Update-TriageWindow {
@@ -3150,18 +3953,18 @@ function Update-TriageWindow {
     $w = $Ui.Window
 
     # Drive status
-    Set-TriageDriveBlock -Window $w -LabelCtl $c['SourceDriveLabel'] -BarCtl $c['SourceDriveBar'] -StatusCtl $c['SourceDriveStatus'] -Facts $Result.Source -Status ([string]$Result.Status) -MissingText 'Source drive not found'
+    Set-TriageDriveBlock -Window $w -LabelCtl $c['SourceDriveLabel'] -BarCtl $c['SourceDriveBar'] -StatusCtl $c['SourceDriveStatus'] -Facts $Result.Source -Status ([string]$Result.Status) -MissingText 'Drive not found'
     $dest = $Result.Destination
     $destStatus = 'UNKNOWN'
     if ($null -ne $dest) { $destStatus = [string](Get-PressureStatus -Facts $dest) }
-    Set-TriageDriveBlock -Window $w -LabelCtl $c['DestDriveLabel'] -BarCtl $c['DestDriveBar'] -StatusCtl $c['DestDriveStatus'] -Facts $dest -Status $destStatus -MissingText 'Destination drive not found'
+    Set-TriageDriveBlock -Window $w -LabelCtl $c['DestDriveLabel'] -BarCtl $c['DestDriveBar'] -StatusCtl $c['DestDriveStatus'] -Facts $dest -Status $destStatus -MissingText 'Drive not found'
 
-    # Summary cards
-    Set-TriageCard -Result $Result -Bucket 'Redirect' -SizeCtl $c['RedirectSize'] -FilesCtl $c['RedirectFiles']
-    Set-TriageCard -Result $Result -Bucket 'Delete' -SizeCtl $c['DeleteSize'] -FilesCtl $c['DeleteFiles']
-    Set-TriageCard -Result $Result -Bucket 'Move' -SizeCtl $c['MoveSize'] -FilesCtl $c['MoveFiles']
+    # The three action tabs carry their totals in the tab name.
+    $c['RedirectTab'].Header = ('Move caches ({0})' -f (Format-Size -Bytes (Get-TriageBucketBytes -Result $Result -Bucket 'Redirect')))
+    $c['DeleteTab'].Header   = ('Delete ({0})' -f (Format-Size -Bytes (Get-TriageBucketBytes -Result $Result -Bucket 'Delete')))
+    $c['MoveTab'].Header     = ('Move files ({0})' -f (Format-Size -Bytes (Get-TriageBucketBytes -Result $Result -Bucket 'Move')))
 
-    # Mechanisms
+    # Overview
     $mech = New-Object 'System.Collections.ObjectModel.ObservableCollection[object]'
     foreach ($m in @($Result.Mechanisms)) {
         $mech.Add([pscustomobject]@{
@@ -3176,17 +3979,15 @@ function Update-TriageWindow {
     }
     $c['MechanismsGrid'].ItemsSource = $mech
 
-    # Fix with one setting
+    # Action tabs
     $c['RedirectMessage'].Text = ''
     Update-TriageRedirectGrid -Ui $Ui -Result $Result
-
-    # Delete rebuildable folders and Move files
     $c['DeleteMessage'].Text = ''
     Update-TriageDeleteGrid -Ui $Ui -Result $Result
     $c['MoveMessage'].Text = ''
     Update-TriageMoveGrid -Ui $Ui -Result $Result
 
-    # Files (honours the current bucket filter)
+    # Files (honours the current filter)
     Set-TriageFilesGrid -Ui $Ui -Result $Result -Bucket (Get-TriageSelectedBucket -Ui $Ui)
 
     # Folders
@@ -3219,180 +4020,47 @@ function Update-TriageWindow {
     $c['DeniedText'].Text = ('Skipped: {0:N0} unreadable, {1:N0} links, {2:N0} too deep' -f [long]$Result.DeniedCount, [long]$Result.LinkFoldersSkipped, [long]$Result.DepthLimitedFolders)
 }
 
-function Invoke-TriageGuiScan {
-    $ui = $script:TriageUi
-    $c = $ui.Controls
-    $caption = 'Disk Space Triage'
-    $src = ([string]$c['SourceBox'].Text).Trim()
-    $dst = ([string]$c['DestBox'].Text).Trim()
-    $minText = ([string]$c['MinSizeBox'].Text).Trim()
-
-    if ($script:TriageBusy) {
-        $c['ProgressText'].Text = 'Wait until the file move has finished.'
-        return
+function Get-TriagePlanItem {
+    # The plan entry behind the selected grid row, or the reason there is none.
+    param($Grid, $Plan, [string]$Key, [string]$What)
+    if ($null -eq $script:TriageLastResult) { return [pscustomobject]@{ Item = $null; Why = 'Nothing to act on yet: choose Scan first.' } }
+    $selected = $Grid.SelectedItem
+    if ($null -eq $selected) { return [pscustomobject]@{ Item = $null; Why = ('Select a ' + $What + ' in the list first (click its row), then choose the button again.') } }
+    foreach ($p in @($Plan)) {
+        if ([string]$p.$Key -ceq [string]$selected.$Key) { return [pscustomobject]@{ Item = $p; Why = '' } }
     }
-
-    if ($src -notmatch '^[A-Za-z]$') {
-        [void][System.Windows.MessageBox]::Show('Source drive must be a single letter, for example C.', $caption, [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
-        return
-    }
-    if ($dst -notmatch '^[A-Za-z]$') {
-        [void][System.Windows.MessageBox]::Show('Destination drive must be a single letter, for example D.', $caption, [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
-        return
-    }
-    if ($src.ToUpper() -eq $dst.ToUpper()) {
-        [void][System.Windows.MessageBox]::Show('Source and destination must be different drives.', $caption, [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
-        return
-    }
-    if ($minText -notmatch '^[0-9]{1,7}$' -or [int]$minText -lt 1 -or [int]$minText -gt 1048576) {
-        [void][System.Windows.MessageBox]::Show('Min file size must be a whole number of megabytes between 1 and 1048576.', $caption, [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
-        return
-    }
-    $minMb = [int]$minText
-
-    $extraRoots = @()
-    foreach ($part in (([string]$c['ExtraRootsBox'].Text) -split ';')) {
-        $trimmed = ([string]$part).Trim().Trim('"').Trim()
-        if ($trimmed.Length -gt 0) { $extraRoots += $trimmed }
-    }
-    foreach ($folder in $extraRoots) {
-        if (-not $folder.StartsWith($src + ':\', [System.StringComparison]::OrdinalIgnoreCase)) {
-            [void][System.Windows.MessageBox]::Show(('Extra folders must be full paths on the source drive, for example ' + $src.ToUpper() + ':\ComfyUI. Not valid: ' + $folder), $caption, [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
-            return
-        }
-    }
-    $scanRoots = @()
-    foreach ($root in @($script:TriageGuiRoots)) {
-        if (-not [string]::IsNullOrWhiteSpace([string]$root)) { $scanRoots += [string]$root }
-    }
-    $scanRoots = @($scanRoots + $extraRoots)
-    $srcLetter = [char]$src.ToUpper()
-    $dstLetter = [char]$dst.ToUpper()
-
-    $script:TriageCancel = $false
-    $c['ScanButton'].IsEnabled = $false
-    $c['CancelButton'].IsEnabled = $true
-    # Nothing else may be started while the scan runs.
-    $c['ExportButton'].IsEnabled = $false
-    $c['ApplyRedirectButton'].IsEnabled = $false
-    $c['UndoRedirectButton'].IsEnabled = $false
-    $c['DeleteStoreButton'].IsEnabled = $false
-    $c['MoveFileButton'].IsEnabled = $false
-    $script:TriageScanning = $true
-    $c['ProgressText'].Text = 'Starting scan...'
-
-    $onProgress = {
-        param($dirsScanned, $bytesSeen, $currentPath)
-        if (($dirsScanned % 50) -eq 0) {
-            $p = [string]$currentPath
-            if ($p.Length -gt 70) { $p = '...' + $p.Substring($p.Length - 67) }
-            $t = ('Scanning: {0:N0} folders, {1} seen. {2}' -f $dirsScanned, (Format-Size -Bytes ([double]$bytesSeen)), $p)
-            $script:TriageUi.Controls['ProgressText'].Text = $t
-            $script:TriageUi.Window.Dispatcher.Invoke([System.Action]{ }, [System.Windows.Threading.DispatcherPriority]::Background)
-        }
-    }
-
-    try {
-        $result = Invoke-TriageScan -SourceDrive $srcLetter -DestinationDrive $dstLetter -MinSizeMB $minMb -OnProgress $onProgress `
-            -AdditionalRoot $scanRoots -SkipDefaultRoots:$script:TriageGuiSkipDefault
-        $script:TriageLastResult = $result
-        Update-TriageWindow -Ui $ui -Result $result
-        $c['ExportButton'].IsEnabled = $true
-        if ($result.Cancelled) {
-            $c['ProgressText'].Text = 'Cancelled. Showing partial results. Scan again to see everything.'
-        }
-        else {
-            $c['ProgressText'].Text = ('Done. {0:N0} files scanned, {1} seen. Start with the first row of "Do these first", then choose Export report.' -f [long]$result.ScannedFiles, (Format-Size -Bytes ([double]$result.ScannedBytes)))
-        }
-    }
-    catch {
-        $msg = $_.Exception.Message
-        $c['ProgressText'].Text = 'Scan failed.'
-        [void][System.Windows.MessageBox]::Show(('The scan failed: ' + $msg), $caption, [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
-    }
-    finally {
-        $script:TriageScanning = $false
-        $c['ScanButton'].IsEnabled = $true
-        $c['CancelButton'].IsEnabled = $false
-        if ($null -ne $script:TriageLastResult) { $c['ExportButton'].IsEnabled = $true }
-        Update-TriageAllActionButtons -Ui $ui
-    }
-}
-
-function Invoke-TriageGuiExport {
-    $ui = $script:TriageUi
-    $c = $ui.Controls
-    $caption = 'Disk Space Triage'
-    if ($null -eq $script:TriageLastResult) {
-        [void][System.Windows.MessageBox]::Show('Run a scan first, then export the report.', $caption, [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information)
-        return
-    }
-    try {
-        $exported = Export-TriageReport -Result $script:TriageLastResult -Directory $script:TriageGuiReportDir
-        $c['ExportPathBox'].Text = [string]$exported.Html
-        $c['ProgressText'].Text = 'Report saved. Open the HTML file shown at the bottom of the window.'
-    }
-    catch {
-        $msg = $_.Exception.Message
-        [void][System.Windows.MessageBox]::Show(('Export failed: ' + $msg), $caption, [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error)
-    }
-}
-
-function Invoke-TriageGuiCopyPath {
-    $ui = $script:TriageUi
-    $text = [string]$ui.Controls['ExportPathBox'].Text
-    if ($text.Length -eq 0) { return }
-    try {
-        [System.Windows.Clipboard]::SetText($text)
-    }
-    catch {
-        $msg = $_.Exception.Message
-        [void][System.Windows.MessageBox]::Show(('Could not copy to the clipboard: ' + $msg), 'Disk Space Triage', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning)
-    }
+    return [pscustomobject]@{ Item = $null; Why = 'That row is out of date. Choose Scan again.' }
 }
 
 function Invoke-TriageGuiApplyRedirect {
     $ui = $script:TriageUi
     $c = $ui.Controls
     $caption = 'Disk Space Triage'
-    if ($c['EnableActionsBox'].IsChecked -ne $true) {
-        $c['RedirectMessage'].Text = 'Not changed: tick "Allow this tool to make these changes" first.'
-        return
-    }
-    $selected = $c['RedirectGrid'].SelectedItem
-    if ($null -eq $selected) {
-        $c['RedirectMessage'].Text = 'Not changed: select a row first.'
-        return
-    }
-    $planItem = $null
-    foreach ($p in @($script:TriageRedirectPlan)) {
-        if ([string]$p.Variable -ceq [string]$selected.Variable) { $planItem = $p }
-    }
-    if ($null -eq $planItem) {
-        $c['RedirectMessage'].Text = 'Not changed: that row is no longer in the plan. Scan again.'
-        return
-    }
+    $pick = Get-TriagePlanItem -Grid $c['RedirectGrid'] -Plan $script:TriageRedirectPlan -Key 'Variable' -What 'store'
+    if ($null -eq $pick.Item) { $c['RedirectMessage'].Text = $pick.Why; return }
+    $planItem = $pick.Item
     if ([string]$planItem.State -ne 'Ready') {
-        $c['RedirectMessage'].Text = 'Not changed: this one cannot be set right now. See the Status column.'
+        $why = [string]$planItem.Reason
+        if ([string]$planItem.State -eq 'AlreadySet') { $why = 'the setting already points to ' + [string]$planItem.CurrentValue + '.' }
+        $c['RedirectMessage'].Text = ('Not changed: ' + $why)
         return
     }
 
     $lines = @(
-        ('Variable: ' + [string]$planItem.Variable),
+        ('Setting: ' + [string]$planItem.Variable),
         ('New folder: ' + [string]$planItem.ProposedValue),
         ('Old folder (stays as it is): ' + [string]$planItem.SourceFolder),
         '',
-        'Nothing will be moved or deleted.',
+        'This changes only where NEW downloads go. Nothing is moved or deleted, so NO space is freed now. To free space, choose No and use "Move to the other drive" instead.',
         [string]$planItem.Effect,
         '',
         'The new folder is outside your user profile. On a shared computer, other users of this PC may be able to read or change it. If the drive is external, keep it connected.',
         '',
-        "You can undo this with 'Undo last change' until you close this window.",
+        "You can undo this with 'Undo last setting change' until you close this window.",
         '',
-        'Make this change?'
+        'Change only the setting?'
     )
-    $text = ($lines -join "`n")
-    $answer = [System.Windows.MessageBox]::Show($text, $caption, [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question, [System.Windows.MessageBoxResult]::No)
+    $answer = [System.Windows.MessageBox]::Show(($lines -join "`n"), $caption, [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question, [System.Windows.MessageBoxResult]::No)
     if ($answer -ne [System.Windows.MessageBoxResult]::Yes) {
         $c['RedirectMessage'].Text = 'Not changed: you chose No.'
         return
@@ -3410,18 +4078,89 @@ function Invoke-TriageGuiApplyRedirect {
         $c['RedirectMessage'].Text = ('Not changed: ' + $failure)
         return
     }
+    Add-TriageSessionRecord -Record $record -Action 'Setting changed (nothing moved)'
 
-    if ($null -ne $script:TriageLastResult) {
-        Update-TriageRedirectGrid -Ui $ui -Result $script:TriageLastResult
+    $message = ('{0} now points to {1}. Close and reopen your terminals and apps (or sign out and in) so they see it. No space was freed: the old folder is still at {2}. {3}' -f [string]$record.Variable, [string]$record.NewValue, [string]$planItem.SourceFolder, [string]$planItem.OldFolder)
+    $c['RedirectMessage'].Text = $message + (Get-TriageOutcomeTail -Record $record)
+    if ($null -ne $script:TriageLastResult) { Update-TriageRedirectGrid -Ui $ui -Result $script:TriageLastResult }
+}
+
+function Invoke-TriageGuiMoveStore {
+    $ui = $script:TriageUi
+    $c = $ui.Controls
+    $caption = 'Disk Space Triage'
+    $pick = Get-TriagePlanItem -Grid $c['RedirectGrid'] -Plan $script:TriageRedirectPlan -Key 'Variable' -What 'store'
+    if ($null -eq $pick.Item) { $c['RedirectMessage'].Text = $pick.Why; return }
+    $planItem = $pick.Item
+    if ([string]$planItem.MoveState -ne 'Ready') {
+        $c['RedirectMessage'].Text = ('Not moved: ' + [string]$planItem.MoveReason)
+        return
     }
-    $message = ('{0} now points to {1}. Close and reopen your terminals and apps (or sign out and in) so they see it. The old folder is still at {2}. {3}' -f [string]$record.Variable, [string]$record.NewValue, [string]$planItem.SourceFolder, [string]$planItem.OldFolder)
-    if (([string]$record.LogPath).Length -gt 0) {
-        $message = $message + ' Change log: ' + [string]$record.LogPath
+
+    $lines = @(
+        ('Store: ' + [string]$planItem.Variable + '  (' + (Format-Size -Bytes ([double]$planItem.SizeBytes)) + ')'),
+        ('From: ' + [string]$planItem.SourceFolder),
+        ('To: ' + [string]$planItem.ProposedValue),
+        '',
+        '1. Every file is copied to the new folder and checked against the original. Nothing is overwritten.',
+        ('2. ' + [string]$planItem.Variable + ' is set for your account, so the tool uses the new folder from now on.'),
+        '3. Windows is asked to put the old folder in the Recycle Bin. If it is too large for the Recycle Bin, Windows asks whether to delete it permanently; by then the checked copy exists, so you can answer Yes.',
+        '',
+        'First close the application that uses this store (for example Python, Ollama, your editor). A large store can take a long time; you can cancel, and nothing is removed before every file has been checked.',
+        'The new folder is outside your user profile. On a shared computer, other users of this PC may be able to read it. If the drive is external, keep it connected.',
+        '',
+        'Move this store?'
+    )
+    $answer = [System.Windows.MessageBox]::Show(($lines -join "`n"), $caption, [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question, [System.Windows.MessageBoxResult]::No)
+    if ($answer -ne [System.Windows.MessageBoxResult]::Yes) {
+        $c['RedirectMessage'].Text = 'Not moved: you chose No.'
+        return
+    }
+
+    $script:TriageCancel = $false
+    $script:TriageMoveTicks = 0
+    Set-TriageBusy -Ui $ui -Busy $true -Text ('Moving ' + [string]$planItem.Variable + '...')
+    $c['RedirectMessage'].Text = 'Listing the files to copy...'
+
+    $onProgress = {
+        param($stage, $done, $total)
+        $script:TriageMoveTicks = $script:TriageMoveTicks + 1
+        if (($script:TriageMoveTicks % 8) -ne 0) { return }
+        $percent = 0.0
+        if ([double]$total -gt 0) { $percent = 100.0 * [double]$done / [double]$total }
+        $script:TriageUi.Controls['BusyBar'].Value = $percent
+        $script:TriageUi.Controls['RedirectMessage'].Text = ('Copying and checking: {0} of {1}. Choose Cancel (top right) to stop; nothing has been removed.' -f (Format-Size -Bytes ([double]$done)), (Format-Size -Bytes ([double]$total)))
+        $script:TriageUi.Window.Dispatcher.Invoke([System.Action]{ }, [System.Windows.Threading.DispatcherPriority]::Background)
+    }
+
+    $record = $null
+    $failure = ''
+    $failed = $false
+    try {
+        $record = Move-TriageStore -Item $planItem -LogDirectory $script:TriageGuiReportDir -OnProgress $onProgress
+    }
+    catch {
+        $failed = $true
+        $failure = $_.Exception.Message
+    }
+    finally {
+        Set-TriageBusy -Ui $ui -Busy $false -Text 'Ready.'
+    }
+    Update-TriageSpaceBar -Ui $ui
+    if ($failed) {
+        $c['RedirectMessage'].Text = ('Not moved: ' + $failure)
+        return
+    }
+    Add-TriageSessionRecord -Record $record -Action ([string]$record.Action)
+
+    if ($record.OriginalRecycled -eq $true) {
+        $message = ('Moved: {0:N0} file(s) copied and checked ({1}); {2} now points to the new folder and the old folder was removed. Reopen your terminals and apps so they see the new setting.' -f [int]$record.Copied, (Format-Size -Bytes ([double]$record.SizeBytes)), [string]$record.Variable)
     } else {
-        $message = $message + ' Note: this change could NOT be written to the change log (is the file open in another program?).'
+        $message = ('Copied and checked ({0}), and {1} now points to the new folder - but the old folder could NOT be removed and still takes space. Close the application that uses it, then delete it yourself: {2}' -f (Format-Size -Bytes ([double]$record.SizeBytes)), [string]$record.Variable, [string]$record.OldValue)
     }
-    $c['RedirectMessage'].Text = $message
-    Update-TriageRedirectButtons -Ui $ui
+    if ([int]$record.Kept -gt 0) { $message = $message + (' {0:N0} file(s) already in the new folder were kept as they are.' -f [int]$record.Kept) }
+    $c['RedirectMessage'].Text = $message + (Get-TriageOutcomeTail -Record $record)
+    if ($null -ne $script:TriageLastResult) { Update-TriageRedirectGrid -Ui $ui -Result $script:TriageLastResult }
 }
 
 function Invoke-TriageGuiUndoRedirect {
@@ -3430,19 +4169,18 @@ function Invoke-TriageGuiUndoRedirect {
     $caption = 'Disk Space Triage'
     $count = $script:TriageRedirectHistory.Count
     if ($count -le 0) {
-        $c['RedirectMessage'].Text = 'There is nothing to undo in this session.'
+        $c['RedirectMessage'].Text = 'Nothing to undo: no setting was changed with "Only change the setting" since this window opened.'
         return
     }
     $record = $script:TriageRedirectHistory[$count - 1]
     $lines = @(
         ('Undo the change to ' + [string]$record.Variable + '?'),
         '',
-        ('The variable will be removed again. The folder ' + [string]$record.NewValue + ' stays where it is; anything downloaded into it since stays there too.'),
+        ('The setting will be removed again. The folder ' + [string]$record.NewValue + ' stays where it is; anything downloaded into it since stays there too.'),
         '',
         'Undo this change?'
     )
-    $text = ($lines -join "`n")
-    $answer = [System.Windows.MessageBox]::Show($text, $caption, [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question, [System.Windows.MessageBoxResult]::No)
+    $answer = [System.Windows.MessageBox]::Show(($lines -join "`n"), $caption, [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question, [System.Windows.MessageBoxResult]::No)
     if ($answer -ne [System.Windows.MessageBoxResult]::Yes) {
         $c['RedirectMessage'].Text = 'Not undone: you chose No.'
         return
@@ -3452,55 +4190,32 @@ function Invoke-TriageGuiUndoRedirect {
     $failure = ''
     try {
         $undo = Undo-TriageRedirect -Record $record -LogDirectory $script:TriageGuiReportDir
-        $script:TriageRedirectHistory.RemoveAt($count - 1)
     }
     catch {
         $failure = $_.Exception.Message
     }
+    # A record that can no longer be undone must not block the ones before it.
+    $script:TriageRedirectHistory.RemoveAt($count - 1)
     if ($failure.Length -gt 0) {
-        # A record that can no longer be undone must not block the ones before it.
-        $script:TriageRedirectHistory.RemoveAt($count - 1)
         $c['RedirectMessage'].Text = ('Not undone: ' + $failure + ' To remove it yourself: Settings > System > About > Advanced system settings > Environment Variables, under User variables.')
-        Update-TriageRedirectButtons -Ui $ui
         return
     }
+    Add-TriageSessionRecord -Record $undo -Action 'Setting change undone'
 
-    if ($null -ne $script:TriageLastResult) {
-        Update-TriageRedirectGrid -Ui $ui -Result $script:TriageLastResult
-    }
     $message = ('{0} is no longer set. Close and reopen your terminals and apps so they see it. The folder {1} was left in place.' -f [string]$record.Variable, [string]$record.NewValue)
-    if (([string]$undo.LogPath).Length -gt 0) { $message = $message + ' Change log: ' + [string]$undo.LogPath }
-    $c['RedirectMessage'].Text = $message
-    Update-TriageRedirectButtons -Ui $ui
+    $c['RedirectMessage'].Text = $message + (Get-TriageOutcomeTail -Record $undo)
+    if ($null -ne $script:TriageLastResult) { Update-TriageRedirectGrid -Ui $ui -Result $script:TriageLastResult }
 }
 
 function Invoke-TriageGuiDeleteStore {
     $ui = $script:TriageUi
     $c = $ui.Controls
     $caption = 'Disk Space Triage'
-    if ($script:TriageScanning -or $script:TriageBusy) {
-        $c['DeleteMessage'].Text = 'Not removed: wait until the current scan or move has finished.'
-        return
-    }
-    if ($c['EnableDeleteBox'].IsChecked -ne $true) {
-        $c['DeleteMessage'].Text = 'Not removed: tick "Allow this tool to send folders to the Recycle Bin" first.'
-        return
-    }
-    $selected = $c['DeleteGrid'].SelectedItem
-    if ($null -eq $selected) {
-        $c['DeleteMessage'].Text = 'Not removed: select a row first.'
-        return
-    }
-    $planItem = $null
-    foreach ($p in @($script:TriageDeletePlan)) {
-        if ([string]$p.Path -ceq [string]$selected.Path) { $planItem = $p }
-    }
-    if ($null -eq $planItem) {
-        $c['DeleteMessage'].Text = 'Not removed: that row is no longer in the plan. Scan again.'
-        return
-    }
+    $pick = Get-TriagePlanItem -Grid $c['DeleteGrid'] -Plan $script:TriageDeletePlan -Key 'Path' -What 'folder'
+    if ($null -eq $pick.Item) { $c['DeleteMessage'].Text = $pick.Why; return }
+    $planItem = $pick.Item
     if ([string]$planItem.State -ne 'Ready') {
-        $c['DeleteMessage'].Text = 'Not removed: this folder cannot be removed right now. See the Status column.'
+        $c['DeleteMessage'].Text = ('Not deleted: ' + [string]$planItem.Reason)
         return
     }
 
@@ -3512,22 +4227,20 @@ function Invoke-TriageGuiDeleteStore {
         'Windows will be asked to put the whole folder in the Recycle Bin, where you can restore it.',
         'If Windows instead asks whether to delete it PERMANENTLY, answer No: that would not be recoverable.',
         '',
+        'The space becomes free when you empty the Recycle Bin afterwards.',
+        '',
         'Send this folder to the Recycle Bin?'
     )
-    $text = ($lines -join "`n")
-    $answer = [System.Windows.MessageBox]::Show($text, $caption, [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question, [System.Windows.MessageBoxResult]::No)
+    $answer = [System.Windows.MessageBox]::Show(($lines -join "`n"), $caption, [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question, [System.Windows.MessageBoxResult]::No)
     if ($answer -ne [System.Windows.MessageBoxResult]::Yes) {
-        $c['DeleteMessage'].Text = 'Not removed: you chose No.'
+        $c['DeleteMessage'].Text = 'Not deleted: you chose No.'
         return
     }
     $record = $null
     $failure = ''
     $failed = $false
     # Nothing else may start while Windows shows its own dialogs.
-    $script:TriageBusy = $true
-    $c['ScanButton'].IsEnabled = $false
-    $c['ExportButton'].IsEnabled = $false
-    Update-TriageAllActionButtons -Ui $ui
+    Set-TriageBusy -Ui $ui -Busy $true -Text 'Sending the folder to the Recycle Bin...'
     try {
         $record = Remove-TriageStore -Item $planItem -LogDirectory $script:TriageGuiReportDir
     }
@@ -3536,19 +4249,18 @@ function Invoke-TriageGuiDeleteStore {
         $failure = $_.Exception.Message
     }
     finally {
-        $script:TriageBusy = $false
-        $c['ScanButton'].IsEnabled = $true
-        if ($null -ne $script:TriageLastResult) { $c['ExportButton'].IsEnabled = $true }
-        Update-TriageAllActionButtons -Ui $ui
+        Set-TriageBusy -Ui $ui -Busy $false -Text 'Ready.'
     }
+    Update-TriageSpaceBar -Ui $ui
     if ($failed) {
-        $c['DeleteMessage'].Text = ('Not removed: ' + $failure)
+        $c['DeleteMessage'].Text = ('Not deleted: ' + $failure)
         return
     }
     if ($record.StillExists -eq $true) {
-        $c['DeleteMessage'].Text = ('Not completely removed: {0}. {1} Look at the folder before trying again.' -f [string]$planItem.Path, [string]$record.Detail)
+        $c['DeleteMessage'].Text = ('Not completely deleted: {0}. {1} Close the application that uses it and look at the folder before trying again.' -f [string]$planItem.Path, [string]$record.Detail)
         return
     }
+    Add-TriageSessionRecord -Record $record -Action 'Folder sent to Recycle Bin'
 
     $remaining = @()
     foreach ($p in @($script:TriageDeletePlan)) {
@@ -3557,43 +4269,19 @@ function Invoke-TriageGuiDeleteStore {
     $script:TriageDeletePlan = $remaining
     Set-TriageDeleteRows -Ui $ui
 
-    $message = ('Removed: {0}. Unless Windows told you otherwise, it is in the Recycle Bin; empty the Recycle Bin to free the space.' -f [string]$planItem.Path)
-    if (([string]$record.LogPath).Length -gt 0) {
-        $message = $message + ' Change log: ' + [string]$record.LogPath
-    } else {
-        $message = $message + ' Note: this change could NOT be written to the change log (is the file open in another program?).'
-    }
-    $c['DeleteMessage'].Text = $message
-    Update-TriageDeleteButtons -Ui $ui
+    $message = ('Sent to the Recycle Bin: {0} ({1}).' -f [string]$planItem.Path, (Format-Size -Bytes ([double]$planItem.SizeBytes)))
+    $c['DeleteMessage'].Text = $message + (Get-TriageOutcomeTail -Record $record)
 }
 
 function Invoke-TriageGuiMoveFile {
     $ui = $script:TriageUi
     $c = $ui.Controls
     $caption = 'Disk Space Triage'
-    if ($script:TriageScanning -or $script:TriageBusy) {
-        $c['MoveMessage'].Text = 'Not moved: wait until the current scan or move has finished.'
-        return
-    }
-    if ($c['EnableMoveBox'].IsChecked -ne $true) {
-        $c['MoveMessage'].Text = 'Not moved: tick "Allow this tool to move files" first.'
-        return
-    }
-    $selected = $c['MoveGrid'].SelectedItem
-    if ($null -eq $selected) {
-        $c['MoveMessage'].Text = 'Not moved: select a row first.'
-        return
-    }
-    $planItem = $null
-    foreach ($p in @($script:TriageMovePlan)) {
-        if ([string]$p.Path -ceq [string]$selected.Path) { $planItem = $p }
-    }
-    if ($null -eq $planItem) {
-        $c['MoveMessage'].Text = 'Not moved: that row is no longer in the plan. Scan again.'
-        return
-    }
+    $pick = Get-TriagePlanItem -Grid $c['MoveGrid'] -Plan $script:TriageMovePlan -Key 'Path' -What 'file'
+    if ($null -eq $pick.Item) { $c['MoveMessage'].Text = $pick.Why; return }
+    $planItem = $pick.Item
     if ([string]$planItem.State -ne 'Ready') {
-        $c['MoveMessage'].Text = 'Not moved: this file cannot be moved right now. See the Status column.'
+        $c['MoveMessage'].Text = ('Not moved: ' + [string]$planItem.Reason)
         return
     }
 
@@ -3603,33 +4291,31 @@ function Invoke-TriageGuiMoveFile {
         ('New place: ' + [string]$planItem.Target),
         '',
         'The file is copied, the copy is read back and compared with the original, and only then is Windows asked to put the original in the Recycle Bin. This can take several minutes for a large file; the window shows progress and you can cancel.',
+        'The space becomes free when you empty the Recycle Bin afterwards.',
         '',
         'Please note: the copy gets the permissions of the new folder, so on a shared computer other users may be able to read it. A downloaded file also loses its "came from the internet" mark.',
         '',
         'Move this file?'
     )
-    $text = ($lines -join "`n")
-    $answer = [System.Windows.MessageBox]::Show($text, $caption, [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question, [System.Windows.MessageBoxResult]::No)
+    $answer = [System.Windows.MessageBox]::Show(($lines -join "`n"), $caption, [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question, [System.Windows.MessageBoxResult]::No)
     if ($answer -ne [System.Windows.MessageBoxResult]::Yes) {
         $c['MoveMessage'].Text = 'Not moved: you chose No.'
         return
     }
 
-    $script:TriageBusy = $true
     $script:TriageCancel = $false
     $script:TriageMoveTicks = 0
-    $c['ScanButton'].IsEnabled = $false
-    $c['ExportButton'].IsEnabled = $false
-    Update-TriageAllActionButtons -Ui $ui
-    $c['MoveCancelButton'].IsEnabled = $true
+    Set-TriageBusy -Ui $ui -Busy $true -Text 'Moving one file...'
     $c['MoveMessage'].Text = 'Starting...'
 
     $onProgress = {
         param($stage, $done, $total)
         $script:TriageMoveTicks = $script:TriageMoveTicks + 1
         if (($script:TriageMoveTicks % 16) -ne 0) { return }
-        $t = ('{0}: {1} of {2}' -f [string]$stage, (Format-Size -Bytes ([double]$done)), (Format-Size -Bytes ([double]$total)))
-        $script:TriageUi.Controls['MoveMessage'].Text = $t
+        $percent = 0.0
+        if ([double]$total -gt 0) { $percent = 100.0 * [double]$done / [double]$total }
+        $script:TriageUi.Controls['BusyBar'].Value = $percent
+        $script:TriageUi.Controls['MoveMessage'].Text = ('{0}: {1} of {2}. Choose Cancel (top right) to stop; nothing has been removed.' -f [string]$stage, (Format-Size -Bytes ([double]$done)), (Format-Size -Bytes ([double]$total)))
         $script:TriageUi.Window.Dispatcher.Invoke([System.Action]{ }, [System.Windows.Threading.DispatcherPriority]::Background)
     }
 
@@ -3644,16 +4330,14 @@ function Invoke-TriageGuiMoveFile {
         $failure = $_.Exception.Message
     }
     finally {
-        $script:TriageBusy = $false
-        $c['MoveCancelButton'].IsEnabled = $false
-        $c['ScanButton'].IsEnabled = $true
-        if ($null -ne $script:TriageLastResult) { $c['ExportButton'].IsEnabled = $true }
-        Update-TriageAllActionButtons -Ui $ui
+        Set-TriageBusy -Ui $ui -Busy $false -Text 'Ready.'
     }
+    Update-TriageSpaceBar -Ui $ui
     if ($failed) {
         $c['MoveMessage'].Text = ('Not moved: ' + $failure)
         return
     }
+    Add-TriageSessionRecord -Record $record -Action ([string]$record.Action)
 
     $remaining = @()
     foreach ($p in @($script:TriageMovePlan)) {
@@ -3663,17 +4347,86 @@ function Invoke-TriageGuiMoveFile {
     Set-TriageMoveRows -Ui $ui
 
     if ($record.OriginalRecycled -eq $true) {
-        $message = ('Moved and verified: {0}. The original was removed; unless Windows told you otherwise it is in the Recycle Bin, so empty that to free the space.' -f [string]$record.NewValue)
+        $message = ('Moved and checked: {0}. The original went to the Recycle Bin.' -f [string]$record.NewValue)
     } else {
-        $message = ('Copied and verified: {0}. The original could NOT be sent to the Recycle Bin and is still at {1}; delete it yourself.' -f [string]$record.NewValue, [string]$record.OldValue)
+        $message = ('Copied and checked: {0}. The original could NOT be sent to the Recycle Bin and is still at {1}; delete it yourself.' -f [string]$record.NewValue, [string]$record.OldValue)
     }
-    if (([string]$record.LogPath).Length -gt 0) {
-        $message = $message + ' Change log: ' + [string]$record.LogPath
+    $c['MoveMessage'].Text = $message + (Get-TriageOutcomeTail -Record $record)
+}
+
+function Invoke-TriageGuiEmptyBin {
+    $ui = $script:TriageUi
+    $c = $ui.Controls
+    $caption = 'Disk Space Triage'
+    $letter = Get-TriageSourceLetter -Ui $ui
+    if ($letter -eq '') {
+        $c['ProgressText'].Text = 'Not emptied: enter the letter of the drive to free up first.'
+        return
+    }
+    $now = Get-TriageSpaceSnapshot -Letter $letter
+    if (-not $now.BinKnown) {
+        $c['ProgressText'].Text = ('Not emptied: the Recycle Bin on {0}: could not be read. Empty it from the desktop instead (right-click the Recycle Bin).' -f $letter)
+        return
+    }
+    if ($now.BinItems -le 0) {
+        $c['ProgressText'].Text = ('Nothing to empty: the Recycle Bin on {0}: is already empty.' -f $letter)
+        Update-TriageSpaceBar -Ui $ui
+        return
+    }
+
+    $lines = @(
+        ('Empty the Recycle Bin on {0}:?' -f $letter),
+        '',
+        ('It holds {0:N0} item(s), {1}.' -f $now.BinItems, (Format-Size -Bytes ([double]$now.BinBytes))),
+        '',
+        'This PERMANENTLY deletes everything in your Recycle Bin on this drive - also things you put there yourself, not only what this tool sent there. It cannot be undone.',
+        'If you are not sure, choose No and look inside the Recycle Bin first.',
+        '',
+        'Permanently delete these items?'
+    )
+    $answer = [System.Windows.MessageBox]::Show(($lines -join "`n"), $caption, [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Warning, [System.Windows.MessageBoxResult]::No)
+    if ($answer -ne [System.Windows.MessageBoxResult]::Yes) {
+        $c['ProgressText'].Text = 'Not emptied: you chose No.'
+        return
+    }
+
+    $record = $null
+    $failure = ''
+    Set-TriageBusy -Ui $ui -Busy $true -Text 'Emptying the Recycle Bin...'
+    try {
+        $record = Clear-TriageRecycleBin -Letter $letter -LogDirectory $script:TriageGuiReportDir
+    }
+    catch {
+        $failure = $_.Exception.Message
+    }
+    finally {
+        Set-TriageBusy -Ui $ui -Busy $false -Text 'Ready.'
+    }
+    Update-TriageSpaceBar -Ui $ui
+    if ($null -eq $record) {
+        $c['ProgressText'].Text = ('Not emptied: ' + $failure)
+        return
+    }
+    Add-TriageSessionRecord -Record $record -Action ([string]$record.Action)
+    if ($record.After.BinItems -gt 0) {
+        $c['ProgressText'].Text = ('Not completely emptied. {0} {1}' -f [string]$record.Failure, [string]$record.Space)
     } else {
-        $message = $message + ' Note: this change could NOT be written to the change log (is the file open in another program?).'
+        $c['ProgressText'].Text = ('Recycle Bin emptied. ' + [string]$record.Space)
     }
-    $c['MoveMessage'].Text = $message
-    Update-TriageMoveButtons -Ui $ui
+}
+
+function Invoke-TriageGuiCopySummary {
+    $ui = $script:TriageUi
+    $c = $ui.Controls
+    Update-TriageSpaceBar -Ui $ui
+    $text = Get-TriageSessionSummary -Start $script:TriageSessionStart -Now $script:TriageSpaceNow -Records $script:TriageSession
+    try {
+        [System.Windows.Clipboard]::SetText($text)
+        $c['ProgressText'].Text = 'Summary copied. It holds sizes and counts only - no file, folder, user or computer names. Paste it where you need it.'
+    }
+    catch {
+        $c['ProgressText'].Text = ('Could not copy to the clipboard: ' + $_.Exception.Message)
+    }
 }
 
 function Show-TriageWindow {
@@ -3690,23 +4443,20 @@ function Show-TriageWindow {
     $script:TriageDeletePlan = @()
     $script:TriageMovePlan = @()
     $script:TriageBusy = $false
+    $script:TriageScanning = $false
     $script:TriageMoveTicks = 0
+    $script:TriageSessionStart = $null
+    $script:TriageSpaceNow = $null
+    $script:TriageSession = New-Object 'System.Collections.Generic.List[object]'
     $script:TriageRedirectHistory = New-Object 'System.Collections.Generic.List[object]'
     $c = $ui.Controls
 
     $c['SourceBox'].Text = [string]$SourceDrive
     $c['DestBox'].Text = [string]$DestinationDrive
 
-    # Initial drive status before any scan
+    # Drive status and Recycle Bin contents before any scan
     try {
-        $srcFacts = Get-DriveFacts -Letter $SourceDrive
-        $srcStatus = 'UNKNOWN'
-        if ($null -ne $srcFacts) { $srcStatus = [string](Get-PressureStatus -Facts $srcFacts) }
-        Set-TriageDriveBlock -Window $ui.Window -LabelCtl $c['SourceDriveLabel'] -BarCtl $c['SourceDriveBar'] -StatusCtl $c['SourceDriveStatus'] -Facts $srcFacts -Status $srcStatus -MissingText 'Source drive not found'
-        $dstFacts = Get-DriveFacts -Letter $DestinationDrive
-        $dstStatus = 'UNKNOWN'
-        if ($null -ne $dstFacts) { $dstStatus = [string](Get-PressureStatus -Facts $dstFacts) }
-        Set-TriageDriveBlock -Window $ui.Window -LabelCtl $c['DestDriveLabel'] -BarCtl $c['DestDriveBar'] -StatusCtl $c['DestDriveStatus'] -Facts $dstFacts -Status $dstStatus -MissingText 'Destination drive not found'
+        Update-TriageSpaceBar -Ui $ui
     }
     catch {
         Write-Verbose ('Initial drive status unavailable: ' + $_.Exception.Message)
@@ -3719,111 +4469,100 @@ function Show-TriageWindow {
     })
     $c['ExportButton'].Add_Click({ Invoke-TriageGuiExport })
     $c['CopyPathButton'].Add_Click({ Invoke-TriageGuiCopyPath })
+    $c['EmptyBinButton'].Add_Click({ Invoke-TriageGuiEmptyBin })
+    $c['SummaryButton'].Add_Click({ Invoke-TriageGuiCopySummary })
     $c['BucketFilter'].Add_SelectionChanged({
         if ($null -ne $script:TriageLastResult) {
             Set-TriageFilesGrid -Ui $script:TriageUi -Result $script:TriageLastResult -Bucket (Get-TriageSelectedBucket -Ui $script:TriageUi)
         }
     })
+    $c['MoveStoreButton'].Add_Click({ Invoke-TriageGuiMoveStore })
     $c['ApplyRedirectButton'].Add_Click({ Invoke-TriageGuiApplyRedirect })
     $c['UndoRedirectButton'].Add_Click({ Invoke-TriageGuiUndoRedirect })
-    $c['EnableActionsBox'].Add_Checked({ Update-TriageRedirectButtons -Ui $script:TriageUi })
-    $c['EnableActionsBox'].Add_Unchecked({ Update-TriageRedirectButtons -Ui $script:TriageUi })
-    $c['RedirectGrid'].Add_SelectionChanged({ Update-TriageRedirectButtons -Ui $script:TriageUi })
     $c['DeleteStoreButton'].Add_Click({ Invoke-TriageGuiDeleteStore })
-    $c['EnableDeleteBox'].Add_Checked({ Update-TriageDeleteButtons -Ui $script:TriageUi })
-    $c['EnableDeleteBox'].Add_Unchecked({ Update-TriageDeleteButtons -Ui $script:TriageUi })
-    $c['DeleteGrid'].Add_SelectionChanged({ Update-TriageDeleteButtons -Ui $script:TriageUi })
     $c['MoveFileButton'].Add_Click({ Invoke-TriageGuiMoveFile })
-    $c['MoveCancelButton'].Add_Click({
-        $script:TriageCancel = $true
-        $script:TriageUi.Controls['MoveMessage'].Text = 'Cancelling...'
-    })
-    $c['EnableMoveBox'].Add_Checked({ Update-TriageMoveButtons -Ui $script:TriageUi })
-    $c['EnableMoveBox'].Add_Unchecked({ Update-TriageMoveButtons -Ui $script:TriageUi })
-    $c['MoveGrid'].Add_SelectionChanged({ Update-TriageMoveButtons -Ui $script:TriageUi })
     Update-TriageAllActionButtons -Ui $ui
     $ui.Window.Add_Closing({ $script:TriageCancel = $true })
 
     [void]$ui.Window.ShowDialog()
 }
 
-function Save-TriageWindowPng {
-    # Self-test only: the one place a file stream is created.
-    param($Root, [string]$Path)
-    $bmp = New-Object System.Windows.Media.Imaging.RenderTargetBitmap -ArgumentList @(1100, 700, 96.0, 96.0, [System.Windows.Media.PixelFormats]::Pbgra32)
-    $bmp.Render($Root)
-    $encoder = New-Object System.Windows.Media.Imaging.PngBitmapEncoder
-    $encoder.Frames.Add([System.Windows.Media.Imaging.BitmapFrame]::Create($bmp))
-    $stream = [System.IO.File]::Create($Path)
-    try {
-        $encoder.Save($stream)
-    }
-    finally {
-        $stream.Dispose()
-    }
-}
-
 function Test-TriageGui {
+    # Self-test: builds the window in each theme, fills it with sample data
+    # and renders it off-screen. Nothing is shown and no handler is attached.
     param([Parameter(Mandatory = $true)][string]$OutputPath)
     Initialize-TriageGui
     $script:TriageRedirectPlan = @()
     $script:TriageDeletePlan = @()
     $script:TriageMovePlan = @()
     $script:TriageBusy = $false
+    $script:TriageScanning = $false
     $script:TriageMoveTicks = 0
+    $script:TriageSessionStart = $null
+    $script:TriageSpaceNow = $null
+    $script:TriageSession = New-Object 'System.Collections.Generic.List[object]'
     $script:TriageRedirectHistory = New-Object 'System.Collections.Generic.List[object]'
-    $ui = New-TriageWindow
 
-    foreach ($name in (Get-TriageControlNames)) {
-        if (-not $ui.Controls.ContainsKey($name) -or $null -eq $ui.Controls[$name]) {
-            throw ('GUI self-test: control not found in XAML: ' + $name)
-        }
-    }
-
-    Update-TriageWindow -Ui $ui -Result (Get-SampleTriageResult)
-
-    if ($ui.Controls['MechanismsGrid'].Items.Count -le 0) { throw 'GUI self-test: MechanismsGrid has no items.' }
-    if ($ui.Controls['FilesGrid'].Items.Count -le 0) { throw 'GUI self-test: FilesGrid has no items.' }
-    if ($ui.Controls['RedirectGrid'].Items.Count -le 0) { throw 'GUI self-test: RedirectGrid has no items.' }
-    if ($ui.Controls['DeleteGrid'].Items.Count -le 0) { throw 'GUI self-test: DeleteGrid has no items.' }
-    if ($ui.Controls['MoveGrid'].Items.Count -le 0) { throw 'GUI self-test: MoveGrid has no items.' }
-
-    $w = $ui.Window
-    $size = New-Object System.Windows.Size -ArgumentList @(1100.0, 700.0)
-    $rect = New-Object System.Windows.Rect -ArgumentList @(0.0, 0.0, 1100.0, 700.0)
-    $w.Measure($size)
-    $w.Arrange($rect)
-    $w.UpdateLayout()
-    $root = $w.Content
-
-    # One picture per tab that matters: the findings, and the only tab that
-    # can change anything.
     $stem = $OutputPath
     if ($OutputPath.EndsWith('.png', [System.StringComparison]::OrdinalIgnoreCase)) {
         $stem = $OutputPath.Substring(0, $OutputPath.Length - 4)
     }
-    $fixPath = $stem + '-fix.png'
-    $deletePath = $stem + '-delete.png'
-    $movePath = $stem + '-move.png'
-    $shots = @(
-        [pscustomobject]@{ Tab = 0; Path = $OutputPath }
-        [pscustomobject]@{ Tab = 1; Path = $fixPath }
-        [pscustomobject]@{ Tab = 2; Path = $deletePath }
-        [pscustomobject]@{ Tab = 3; Path = $movePath }
-    )
-    foreach ($shot in $shots) {
-        $ui.Controls['MainTabs'].SelectedIndex = $shot.Tab
-        # Give the content root the full bitmap area so the PNG has no empty margin.
-        $root.Measure($size)
-        $root.Arrange($rect)
-        $root.UpdateLayout()
-        # Star-sized grid columns are resolved by queued dispatcher work; let it
-        # run, then lay out once more so the picture matches a shown window.
-        $w.Dispatcher.Invoke([System.Action]{ }, [System.Windows.Threading.DispatcherPriority]::ApplicationIdle)
-        $root.Measure($size)
-        $root.Arrange($rect)
-        $root.UpdateLayout()
-        Save-TriageWindowPng -Root $root -Path $shot.Path
+    $size = New-Object System.Windows.Size -ArgumentList @(1100.0, 700.0)
+    $rect = New-Object System.Windows.Rect -ArgumentList @(0.0, 0.0, 1100.0, 700.0)
+
+    foreach ($theme in @('Light', 'Dark', 'Contrast')) {
+        $ui = New-TriageWindow -Theme $theme
+        foreach ($name in (Get-TriageControlNames)) {
+            if (-not $ui.Controls.ContainsKey($name) -or $null -eq $ui.Controls[$name]) {
+                throw ('GUI self-test: control not found in XAML: ' + $name)
+            }
+        }
+        $sample = Get-SampleTriageResult
+        $script:TriageLastResult = $sample
+        Update-TriageWindow -Ui $ui -Result $sample
+        Update-TriageSpaceBar -Ui $ui
+        Update-TriageAllActionButtons -Ui $ui
+        $script:TriageLastResult = $null
+
+        foreach ($grid in @('MechanismsGrid', 'FilesGrid', 'RedirectGrid', 'DeleteGrid', 'MoveGrid')) {
+            if ($ui.Controls[$grid].Items.Count -le 0) { throw ('GUI self-test: ' + $grid + ' has no items.') }
+        }
+        # Nothing may be switched off while the window is idle.
+        foreach ($button in @('ScanButton', 'ExportButton', 'EmptyBinButton', 'SummaryButton', 'MoveStoreButton', 'ApplyRedirectButton', 'UndoRedirectButton', 'DeleteStoreButton', 'MoveFileButton')) {
+            if (-not $ui.Controls[$button].IsEnabled) { throw ('GUI self-test: ' + $button + ' is disabled in an idle window.') }
+        }
+        if (([string]$ui.Controls['RedirectTab'].Header) -notmatch '\(') { throw 'GUI self-test: the tab headers carry no totals.' }
+        if ($theme -eq 'Contrast') { continue }
+
+        $w = $ui.Window
+        $w.Measure($size)
+        $w.Arrange($rect)
+        $w.UpdateLayout()
+        $root = $w.Content
+
+        $suffix = ''
+        if ($theme -eq 'Dark') { $suffix = '-dark' }
+        $shots = @(
+            [pscustomobject]@{ Tab = 0; Path = ($stem + $suffix + '.png') }
+            [pscustomobject]@{ Tab = 1; Path = ($stem + $suffix + '-fix.png') }
+            [pscustomobject]@{ Tab = 2; Path = ($stem + $suffix + '-delete.png') }
+            [pscustomobject]@{ Tab = 3; Path = ($stem + $suffix + '-move.png') }
+        )
+        foreach ($shot in $shots) {
+            if ($theme -eq 'Dark' -and $shot.Tab -gt 1) { continue }
+            $ui.Controls['MainTabs'].SelectedIndex = $shot.Tab
+            # Give the content root the full bitmap area so the PNG has no empty margin.
+            $root.Measure($size)
+            $root.Arrange($rect)
+            $root.UpdateLayout()
+            # Star-sized grid columns are resolved by queued dispatcher work; let it
+            # run, then lay out once more so the picture matches a shown window.
+            $w.Dispatcher.Invoke([System.Action]{ }, [System.Windows.Threading.DispatcherPriority]::ApplicationIdle)
+            $root.Measure($size)
+            $root.Arrange($rect)
+            $root.UpdateLayout()
+            Save-TriageWindowPng -Root $root -Path $shot.Path
+        }
     }
     return $true
 }
@@ -3943,7 +4682,11 @@ if ($Mode -eq 'Console') {
     Write-Host "  $($report.Markdown)"
     Write-Host "  $($report.Csv)"
     Write-Host ''
-    Write-Host 'No changes were made to your system. Review the report, then act yourself.' -ForegroundColor Yellow
+    $space = Get-TriageSpaceSnapshot -Letter $SourceDrive
+    if ($space.BinKnown -and $space.BinItems -gt 0) {
+        Write-Host ("The Recycle Bin on {0}: holds {1} in {2} item(s). That space is not free until it is emptied." -f $space.Letter, (Format-Size $space.BinBytes), $space.BinItems) -ForegroundColor Yellow
+    }
+    Write-Host 'No changes were made to your system. To act on the findings, start the tool without -Mode Console.' -ForegroundColor Yellow
     return
 }
 

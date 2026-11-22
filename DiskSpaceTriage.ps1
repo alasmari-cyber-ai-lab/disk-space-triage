@@ -1222,6 +1222,8 @@ function Get-TriageRedirectPlan {
         } elseif ($state -eq 'AlreadySet') {
             if ($current.TrimEnd('\') -ieq $proposed -and (Test-Path -LiteralPath $source -PathType Container)) {
                 $moveState = 'Ready'; $moveReason = 'the setting is already switched; only the old files still have to move'
+            } elseif ($current.TrimEnd('\') -ieq $proposed) {
+                $moveReason = 'Already moved: nothing is left in the old folder.'
             } else {
                 $moveReason = 'The variable points at a folder this tool did not choose. Move the old files yourself.'
             }
@@ -1645,7 +1647,9 @@ function Get-TriageMovePlan {
 function Get-TriageFileHash {
     # SHA-256 of a file, read in blocks so progress can be reported and the
     # operation cancelled. Returns $null when cancelled.
-    param([string]$Path, [scriptblock]$OnProgress, [string]$Stage)
+    # With -BaseBytes 0 or more the callback gets that steady overall figure
+    # instead of this file's own progress (used while many files are moved).
+    param([string]$Path, [scriptblock]$OnProgress, [string]$Stage, [long]$BaseBytes = -1, [long]$TotalBytes = 0)
 
     $sha    = [System.Security.Cryptography.SHA256]::Create()
     $buffer = New-Object byte[] 4194304
@@ -1658,7 +1662,9 @@ function Get-TriageFileHash {
             if ($read -le 0) { break }
             [void]$sha.TransformBlock($buffer, 0, $read, $null, 0)
             $done += $read
-            if ($null -ne $OnProgress) { & $OnProgress $Stage $done $total }
+            if ($null -ne $OnProgress) {
+                if ($BaseBytes -ge 0) { & $OnProgress $Stage $BaseBytes $TotalBytes } else { & $OnProgress $Stage $done $total }
+            }
             if ($script:TriageCancel) { return $null }
         }
         [void]$sha.TransformFinalBlock($buffer, 0, 0)
@@ -1778,15 +1784,21 @@ function Get-TriageRecycleBinInfo {
     param([string]$Letter)
     $info = [pscustomobject]@{ Letter = $Letter.ToUpper(); Items = 0; Bytes = [long]0; Known = $false }
     try {
+        # Only NTFS and ReFS keep one Recycle Bin folder per user; anything
+        # else is reported as unknown, never as empty.
+        $facts = Get-DriveFacts -Letter $Letter
+        if ($null -eq $facts -or ($facts.Format -ne 'NTFS' -and $facts.Format -ne 'ReFS')) { return $info }
         $sid = [string][Security.Principal.WindowsIdentity]::GetCurrent().User.Value
         $bin = ('{0}:\$Recycle.Bin\{1}' -f $Letter.ToUpper(), $sid)
         if (-not (Test-Path -LiteralPath $bin -PathType Container)) { $info.Known = $true; return $info }
         $folder = New-Object System.IO.DirectoryInfo $bin
         $buffer = New-Object byte[] 16
         foreach ($entry in $folder.EnumerateFiles('$I*')) {
-            $read   = 0
-            $stream = [System.IO.File]::OpenRead($entry.FullName)
-            try { $read = $stream.Read($buffer, 0, 16) } finally { $stream.Dispose() }
+            $read = 0
+            try {
+                $stream = [System.IO.File]::OpenRead($entry.FullName)
+                try { $read = $stream.Read($buffer, 0, 16) } finally { $stream.Dispose() }
+            } catch { continue }       # one record in use must not hide the rest
             if ($read -lt 16) { continue }
             $size = [System.BitConverter]::ToInt64($buffer, 8)
             if ($size -lt 0) { continue }
@@ -1856,7 +1868,7 @@ function Clear-TriageRecycleBin {
     $space = Format-TriageSpaceChange -Before $before -After $after
 
     $action = 'Empty Recycle Bin'
-    if ($after.BinItems -gt 0) { $action = 'Empty Recycle Bin (not completed)' }
+    if ($after.BinItems -gt 0 -or -not $after.BinKnown) { $action = 'Empty Recycle Bin (not completed)' }
     $record = [pscustomobject]@{
         When      = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture)
         Action    = $action
@@ -1918,9 +1930,9 @@ function Copy-TriageVerifiedFile {
 
         if ($done -ne $Size -or $in.Length -ne $Size) { throw 'The file changed while it was being copied. Nothing was removed.' }
         # One file: show the read-back. Many files: keep the overall figure steady.
-        $verifyProgress = $null
-        if ($TotalBytes -eq $Size) { $verifyProgress = $OnProgress }
-        $copyHash = Get-TriageFileHash -Path $partial -OnProgress $verifyProgress -Stage 'Verifying'
+        $steady = [long]-1
+        if ($TotalBytes -ne $Size) { $steady = $BaseBytes + $Size }
+        $copyHash = Get-TriageFileHash -Path $partial -OnProgress $OnProgress -Stage 'Verifying' -BaseBytes $steady -TotalBytes $TotalBytes
         if ($null -eq $copyHash) { throw 'Cancelled. Nothing was removed.' }
         if ($copyHash -cne $sourceHash) { throw 'The copy does not match the original. Nothing was removed.' }
 
@@ -1943,22 +1955,26 @@ function Get-TriageStoreInventory {
     <#
         Read-only. Every folder and file below a store folder, for copying.
         Throws when the store holds anything the tool will not copy blindly:
-        a junction, symbolic link or cloud placeholder, or an entry that
-        cannot be read.
+        a junction, symbolic link or cloud placeholder,
+        an encrypted file, or an entry that cannot be read.
     #>
-    param([string]$Root)
+    param([string]$Root, [scriptblock]$OnProgress)
     $folders = New-Object 'System.Collections.Generic.List[string]'
     $files   = New-Object 'System.Collections.Generic.List[object]'
     $bytes   = [long]0
     $newest  = [long]0
+    $seen    = 0
     $queue   = New-Object 'System.Collections.Generic.Queue[object]'
     $queue.Enqueue($Root)
     while ($queue.Count -gt 0) {
-        if ($script:TriageCancel) { throw 'Cancelled. Nothing was changed.' }
+        if ($script:TriageCancel) { throw 'Cancelled. Nothing was removed.' }
+        $seen = $seen + 1
+        if ($null -ne $OnProgress -and ($seen % 100) -eq 0) { & $OnProgress 'Listing' 0 0 }
         $info = New-Object System.IO.DirectoryInfo ([string]$queue.Dequeue())
         foreach ($entry in $info.EnumerateFileSystemInfos()) {
-            # ReparsePoint, Offline, RecallOnDataAccess
-            if (([int]$entry.Attributes -band 0x401400) -ne 0) { throw "it contains a link or a cloud placeholder ($($entry.FullName))" }
+            # ReparsePoint, Offline, RecallOnDataAccess, Encrypted. A copy of an
+            # encrypted file would land unencrypted on the other drive.
+            if (([int]$entry.Attributes -band 0x405400) -ne 0) { throw "it contains a link, a cloud placeholder or an encrypted file ($($entry.FullName))" }
             if ($entry.Attributes -band [System.IO.FileAttributes]::Directory) {
                 $folders.Add($entry.FullName)
                 $queue.Enqueue($entry.FullName)
@@ -1972,6 +1988,29 @@ function Get-TriageStoreInventory {
     return [pscustomobject]@{ Folders = $folders; Files = $files; Bytes = $bytes; Newest = $newest }
 }
 
+function Compare-TriageStoreInventory {
+    <#
+        Returns '' when two listings of the same store are identical entry by
+        entry (every folder; every file with its length and last-write time),
+        otherwise the first difference. Totals alone would miss a rename.
+    #>
+    param($First, $Second)
+    if ($First.Folders.Count -ne $Second.Folders.Count) { return 'a folder was added or removed' }
+    if ($First.Files.Count -ne $Second.Files.Count)     { return 'a file was added or removed' }
+    $known = @{}
+    foreach ($folder in $First.Folders) { $known['D|' + [string]$folder] = $true }
+    foreach ($file in $First.Files)     { $known['F|' + [string]$file.Path] = ('{0}|{1}' -f $file.Length, $file.Stamp.Ticks) }
+    foreach ($folder in $Second.Folders) {
+        if (-not $known.ContainsKey('D|' + [string]$folder)) { return 'a folder was renamed or added' }
+    }
+    foreach ($file in $Second.Files) {
+        $key = 'F|' + [string]$file.Path
+        if (-not $known.ContainsKey($key)) { return 'a file was renamed or added' }
+        if ($known[$key] -cne ('{0}|{1}' -f $file.Length, $file.Stamp.Ticks)) { return 'a file was changed' }
+    }
+    return ''
+}
+
 function Undo-TriageStoreCopy {
     <#
         Rolls back a store copy that did not finish: deletes exactly the
@@ -1983,10 +2022,12 @@ function Undo-TriageStoreCopy {
     if ($Root -notmatch '^[A-Za-z]:\\FromC\\Users\\[^\\]+\\[^\\]') { return }
     foreach ($created in @($Files)) {
         if (-not ([string]$created).StartsWith($Root + '\', [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+        if ([System.IO.Path]::GetFullPath([string]$created) -cne [string]$created) { continue }
         try { [System.IO.File]::Delete($created) } catch { Write-Warning "Could not remove the unfinished copy: $created" }
     }
     foreach ($made in @($Folders | Sort-Object -Property Length -Descending)) {
         if (([string]$made) -ne $Root -and -not ([string]$made).StartsWith($Root + '\', [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+        if ([System.IO.Path]::GetFullPath([string]$made) -cne [string]$made) { continue }
         # One argument: removes the folder only if it is empty.
         try { [System.IO.Directory]::Delete($made) } catch { Write-Verbose "Left in place (not empty): $made" }
     }
@@ -2046,7 +2087,7 @@ function Move-TriageStore {
 
     $script:TriageCancel = $false
     $inventory = $null
-    try { $inventory = Get-TriageStoreInventory -Root $source } catch { throw "Refused: the old folder cannot be moved by the tool because $($_.Exception.Message)" }
+    try { $inventory = Get-TriageStoreInventory -Root $source -OnProgress $OnProgress } catch { throw "Refused: the old folder cannot be moved by the tool because $($_.Exception.Message)" }
     foreach ($file in $inventory.Files) {
         if (($value.Length + $file.Path.Length - $source.Length) -gt 240) { throw 'Refused: a path in the new folder would be too long for Windows.' }
     }
@@ -2080,9 +2121,10 @@ function Move-TriageStore {
             if ($script:TriageCancel) { throw 'Cancelled. Nothing was removed.' }
             $destination = $value + $file.Path.Substring($source.Length)
             if (Test-Path -LiteralPath $destination) {
-                # Possible only when merging into a folder that is already in use.
-                $hashOld = Get-TriageFileHash -Path $file.Path -OnProgress $null -Stage ''
-                $hashNew = Get-TriageFileHash -Path $destination -OnProgress $null -Stage ''
+                # Expected only when merging into a folder that is already in use.
+                if (-not $merge) { throw "Something appeared in the new folder while it was being filled: $destination" }
+                $hashOld = Get-TriageFileHash -Path $file.Path -OnProgress $OnProgress -Stage 'Comparing' -BaseBytes $doneBytes -TotalBytes $inventory.Bytes
+                $hashNew = Get-TriageFileHash -Path $destination -OnProgress $OnProgress -Stage 'Comparing' -BaseBytes $doneBytes -TotalBytes $inventory.Bytes
                 if ($null -eq $hashOld -or $null -eq $hashNew) { throw 'Cancelled. Nothing was removed.' }
                 if ($hashOld -ceq $hashNew) { $same = $same + 1 }
                 elseif ($script:TriagePureCaches.ContainsKey($target.Variable)) { $kept = $kept + 1 }
@@ -2098,9 +2140,10 @@ function Move-TriageStore {
         }
 
         # The old folder must still be exactly what was copied.
-        $again = Get-TriageStoreInventory -Root $source
-        if ($again.Files.Count -ne $inventory.Files.Count -or $again.Bytes -ne $inventory.Bytes -or $again.Newest -ne $inventory.Newest) {
-            throw 'The old folder changed while it was being copied. Close the application that uses it, then try again. Nothing was removed.'
+        $again   = Get-TriageStoreInventory -Root $source -OnProgress $OnProgress
+        $changed = Compare-TriageStoreInventory -First $inventory -Second $again
+        if ($changed -ne '') {
+            throw "The old folder changed while it was being copied ($changed). Close the application that uses it, then try again. Nothing was removed."
         }
 
         if (-not $merge) { [void](Set-TriageRedirect -Item $Item -LogDirectory $logTarget -Populated) }
@@ -2113,10 +2156,20 @@ function Move-TriageStore {
         if (-not $ok -and -not $merge) { Undo-TriageStoreCopy -Root $value -Files $createdFiles -Folders $createdFolders }
     }
 
+    # Last look, after the setting was switched and immediately before the
+    # old folder goes: anything written there in the meantime was not copied,
+    # so the folder stays.
     $failure = ''
     try {
+        $last = Get-TriageStoreInventory -Root $source -OnProgress $OnProgress
+        $late = Compare-TriageStoreInventory -First $inventory -Second $last
+        if ($late -ne '') { $failure = "The old folder changed after it was copied ($late), so it was kept." }
+    } catch { $failure = 'The old folder could not be listed again, so it was kept. ' + $_.Exception.Message }
+    if ($failure -eq '') {
+      try {
         [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($source, [Microsoft.VisualBasic.FileIO.UIOption]::AllDialogs, [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin, [Microsoft.VisualBasic.FileIO.UICancelOption]::ThrowException)
-    } catch { $failure = $_.Exception.Message }
+      } catch { $failure = $_.Exception.Message }
+    }
     $recycled = -not (Test-Path -LiteralPath $source)
 
     $after  = Get-TriageSpaceSnapshot -Letter $source.Substring(0, 1)
@@ -4117,6 +4170,7 @@ function Invoke-TriageGuiMoveStore {
         ('2. ' + [string]$planItem.Variable + ' is set for your account, so the tool uses the new folder from now on.'),
         '3. Windows is asked to put the old folder in the Recycle Bin. If it is too large for the Recycle Bin, Windows asks whether to delete it permanently; by then the checked copy exists, so you can answer Yes.',
         '',
+        'Everything in the store moves, including sign-in tokens and settings files kept there (for example the Hugging Face token).',
         'First close the application that uses this store (for example Python, Ollama, your editor). A large store can take a long time; you can cancel, and nothing is removed before every file has been checked.',
         'The new folder is outside your user profile. On a shared computer, other users of this PC may be able to read it. If the drive is external, keep it connected.',
         '',
@@ -4130,8 +4184,6 @@ function Invoke-TriageGuiMoveStore {
 
     $script:TriageCancel = $false
     $script:TriageMoveTicks = 0
-    Set-TriageBusy -Ui $ui -Busy $true -Text ('Moving ' + [string]$planItem.Variable + '...')
-    $c['RedirectMessage'].Text = 'Listing the files to copy...'
 
     $onProgress = {
         param($stage, $done, $total)
@@ -4139,8 +4191,12 @@ function Invoke-TriageGuiMoveStore {
         if (($script:TriageMoveTicks % 8) -ne 0) { return }
         $percent = 0.0
         if ([double]$total -gt 0) { $percent = 100.0 * [double]$done / [double]$total }
-        $script:TriageUi.Controls['BusyBar'].Value = $percent
-        $script:TriageUi.Controls['RedirectMessage'].Text = ('Copying and checking: {0} of {1}. Choose Cancel (top right) to stop; nothing has been removed.' -f (Format-Size -Bytes ([double]$done)), (Format-Size -Bytes ([double]$total)))
+        if ([string]$stage -eq 'Listing') {
+            $script:TriageUi.Controls['RedirectMessage'].Text = 'Listing the files... Choose Cancel (top right) to stop; nothing has been removed.'
+        } else {
+            $script:TriageUi.Controls['BusyBar'].Value = $percent
+            $script:TriageUi.Controls['RedirectMessage'].Text = ('Copying and checking: {0} of {1}. Choose Cancel (top right) to stop; nothing has been removed.' -f (Format-Size -Bytes ([double]$done)), (Format-Size -Bytes ([double]$total)))
+        }
         $script:TriageUi.Window.Dispatcher.Invoke([System.Action]{ }, [System.Windows.Threading.DispatcherPriority]::Background)
     }
 
@@ -4148,6 +4204,8 @@ function Invoke-TriageGuiMoveStore {
     $failure = ''
     $failed = $false
     try {
+        Set-TriageBusy -Ui $ui -Busy $true -Text ('Moving ' + [string]$planItem.Variable + '...')
+        $c['RedirectMessage'].Text = 'Listing the files to copy...'
         $record = Move-TriageStore -Item $planItem -LogDirectory $script:TriageGuiReportDir -OnProgress $onProgress
     }
     catch {
@@ -4163,11 +4221,16 @@ function Invoke-TriageGuiMoveStore {
         return
     }
     Add-TriageSessionRecord -Record $record -Action ([string]$record.Action)
+    # The setting now belongs to a store that has moved: undoing it would
+    # point the tool back at a folder that is gone.
+    for ($i = $script:TriageRedirectHistory.Count - 1; $i -ge 0; $i--) {
+        if ([string]$script:TriageRedirectHistory[$i].Variable -ceq [string]$record.Variable) { $script:TriageRedirectHistory.RemoveAt($i) }
+    }
 
     if ($record.OriginalRecycled -eq $true) {
         $message = ('Moved: {0:N0} file(s) copied and checked ({1}); {2} now points to the new folder and the old folder was removed. Reopen your terminals and apps so they see the new setting.' -f [int]$record.Copied, (Format-Size -Bytes ([double]$record.SizeBytes)), [string]$record.Variable)
     } else {
-        $message = ('Copied and checked ({0}), and {1} now points to the new folder - but the old folder could NOT be removed and still takes space. Close the application that uses it, then delete it yourself: {2}' -f (Format-Size -Bytes ([double]$record.SizeBytes)), [string]$record.Variable, [string]$record.OldValue)
+        $message = ('Copied and checked ({0}), and {1} now points to the new folder - but the old folder was NOT removed and still takes space: {2} Look at what is in it before deleting it yourself.' -f (Format-Size -Bytes ([double]$record.SizeBytes)), [string]$record.Variable, [string]$record.OldValue)
     }
     if ([int]$record.Kept -gt 0) { $message = $message + (' {0:N0} file(s) already in the new folder were kept as they are.' -f [int]$record.Kept) }
     $c['RedirectMessage'].Text = $message + (Get-TriageOutcomeTail -Record $record)
@@ -4251,8 +4314,8 @@ function Invoke-TriageGuiDeleteStore {
     $failure = ''
     $failed = $false
     # Nothing else may start while Windows shows its own dialogs.
-    Set-TriageBusy -Ui $ui -Busy $true -Text 'Sending the folder to the Recycle Bin...'
     try {
+        Set-TriageBusy -Ui $ui -Busy $true -Text 'Sending the folder to the Recycle Bin...'
         $record = Remove-TriageStore -Item $planItem -LogDirectory $script:TriageGuiReportDir
     }
     catch {
@@ -4316,8 +4379,6 @@ function Invoke-TriageGuiMoveFile {
 
     $script:TriageCancel = $false
     $script:TriageMoveTicks = 0
-    Set-TriageBusy -Ui $ui -Busy $true -Text 'Moving one file...'
-    $c['MoveMessage'].Text = 'Starting...'
 
     $onProgress = {
         param($stage, $done, $total)
@@ -4334,6 +4395,8 @@ function Invoke-TriageGuiMoveFile {
     $failure = ''
     $failed = $false
     try {
+        Set-TriageBusy -Ui $ui -Busy $true -Text 'Moving one file...'
+        $c['MoveMessage'].Text = 'Starting...'
         $record = Move-TriageFile -Item $planItem -LogDirectory $script:TriageGuiReportDir -OnProgress $onProgress
     }
     catch {
@@ -4403,8 +4466,8 @@ function Invoke-TriageGuiEmptyBin {
 
     $record = $null
     $failure = ''
-    Set-TriageBusy -Ui $ui -Busy $true -Text 'Emptying the Recycle Bin...'
     try {
+        Set-TriageBusy -Ui $ui -Busy $true -Text 'Emptying the Recycle Bin...'
         $record = Clear-TriageRecycleBin -Letter $letter -LogDirectory $script:TriageGuiReportDir
     }
     catch {
@@ -4419,7 +4482,7 @@ function Invoke-TriageGuiEmptyBin {
         return
     }
     Add-TriageSessionRecord -Record $record -Action ([string]$record.Action)
-    if ($record.After.BinItems -gt 0) {
+    if ([string]$record.Action -ne 'Empty Recycle Bin') {
         $c['ProgressText'].Text = ('Not completely emptied. {0} {1}' -f [string]$record.Failure, [string]$record.Space)
     } else {
         $c['ProgressText'].Text = ('Recycle Bin emptied. ' + [string]$record.Space)

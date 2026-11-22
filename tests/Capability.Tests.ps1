@@ -341,6 +341,18 @@ Describe '.NET surface' {
         ($callers -join ',') | Should -Be 'Invoke-TriageGuiEmptyBin'
     }
 
+    It 'reaches the store move, its rollback and the populated-folder switch from one place each' {
+        function Get-Callers { param($Name)
+            @($script:Commands | Where-Object { $_.GetCommandName() -eq $Name } | ForEach-Object { Get-EnclosingFunction -Node $_ }) -join ',' }
+        Get-Callers 'Move-TriageStore'     | Should -Be 'Invoke-TriageGuiMoveStore'
+        Get-Callers 'Undo-TriageStoreCopy' | Should -Be 'Move-TriageStore'
+        Get-Callers 'Remove-TriageStore'   | Should -Be 'Invoke-TriageGuiDeleteStore'
+        Get-Callers 'Move-TriageFile'      | Should -Be 'Invoke-TriageGuiMoveFile'
+        $populated = @($script:Commands | Where-Object { $_.Extent.Text -match '-Populated\b' })
+        $populated.Count | Should -Be 1
+        Get-EnclosingFunction -Node $populated[0] | Should -Be 'Move-TriageStore'
+    }
+
     It 'reads exactly one registry value (the app theme) and writes none' {
         $static = @($script:Ast.FindAll({ param($n)
             $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and $n.Static -and

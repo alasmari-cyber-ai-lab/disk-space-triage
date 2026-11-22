@@ -56,6 +56,13 @@ BeforeAll {
     }
 
     if (-not $script:NoVolumes) {
+        # These tests empty a Recycle Bin. Refuse outright to do that on a real drive.
+        foreach ($letter in @($script:S, $script:T)) {
+            $label = (New-Object System.IO.DriveInfo ($letter + ':\')).VolumeLabel
+            if ($letter -eq $env:SystemDrive.Substring(0, 1) -or $label -notlike 'TRIAGE*') {
+                throw "Volume $letter is not a throw-away test volume (its label must start with TRIAGE)."
+            }
+        }
         $script:SavedProfile = $env:USERPROFILE
         $script:SavedVar     = [Environment]::GetEnvironmentVariable('TRITON_CACHE_DIR', 'User')
         $script:SavedKeras   = [Environment]::GetEnvironmentVariable('KERAS_HOME', 'User')
@@ -173,6 +180,28 @@ Describe 'Move a store: contents, setting and space' -Skip:$script:NoVolumes {
         @(Get-ChildItem -LiteralPath "$($script:T):\FromC\Users\ci" -Recurse -File -Force -ErrorAction SilentlyContinue).Count | Should -Be 0
         Test-Path -LiteralPath $script:Value | Should -BeFalse
         (Get-FileHash -LiteralPath "$script:Store\a\big.bin" -Algorithm SHA256).Hash | Should -Be $script:HashBig
+    }
+    It 'notices a file renamed inside the old folder during the copy, takes the copies back and removes nothing' {
+        $script:Renamed = $false
+        $rename = {
+            param($stage, $done, $total)
+            if (-not $script:Renamed -and $stage -eq 'Copying' -and $done -gt 4MB) {
+                $script:Renamed = $true
+                Rename-Item -LiteralPath "$script:Store\empty" -NewName 'renamed'
+            }
+        }
+        try {
+            { Move-TriageStore -Item $script:Item -LogDirectory $script:Log -OnProgress $rename } | Should -Throw '*changed while it was being copied*'
+            $script:Renamed | Should -BeTrue
+            [Environment]::GetEnvironmentVariable($script:Var, 'User') | Should -BeNullOrEmpty
+            Test-Path -LiteralPath $script:Value | Should -BeFalse
+            Test-Path -LiteralPath "$script:Store\a\big.bin" | Should -BeTrue
+        } finally {
+            if (Test-Path -LiteralPath "$script:Store\renamed") { Rename-Item -LiteralPath "$script:Store\renamed" -NewName 'empty' }
+        }
+    }
+    It 'finds two listings of an untouched store identical' {
+        Compare-TriageStoreInventory -First (Get-TriageStoreInventory -Root $script:Store) -Second (Get-TriageStoreInventory -Root $script:Store) | Should -Be ''
     }
     It 'refuses a store that contains a junction, and changes nothing' {
         cmd /c mklink /J "$script:Store\a\link" "$($script:S):\work" | Out-Null

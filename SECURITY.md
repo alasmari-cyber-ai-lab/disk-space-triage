@@ -34,6 +34,8 @@ No), measured, logged, and narrow enough to be checked by reading one file.
 
 - **The effect of "Only change the setting".** The owning tool downloads into the new folder; the old folder stays on the system drive and no space is freed. A Hugging Face folder redirected this way no longer contains your sign-in token until you sign in again or copy it. "Move to the other drive" avoids both by bringing the contents along.
 - **A store in use while it is moved.** The tool re-lists the old folder after copying and stops if anything changed, but it cannot see a program that merely holds files open. Close the owning program first. If Windows cannot recycle the old folder because files are in use, the tool says the old folder is still there.
+- **What a store move does not carry over.** File contents and last-write times are copied; hidden and read-only flags, alternate data streams and permissions are not. A store holding an encrypted (EFS) file is refused.
+- **Who owns the new folder.** The tool refuses a new folder that already has content, but it does not check who created an empty one or its parent folders below `D:\FromC`. On a shared PC another user could prepare that folder and keep control of it. Do not use the move actions on a PC you share.
 - **Files that already exist in the new folder.** When the setting already points at the new folder and both folders hold a file of the same name with different contents, a pure download cache keeps the file already in use; any other store stops without removing anything.
 
 - **A modified copy.** If you did not get the file from this repository, compare its SHA-256 with the published one, or read it.
